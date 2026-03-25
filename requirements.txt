@@ -1,4 +1,4 @@
 aiogram==3.13.*
-from google_search_results import GoogleSearch
+google-search-results
 aiosqlite
 python-dotenv
