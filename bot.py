@@ -28,15 +28,12 @@ class States(StatesGroup):
     query = State()
     min_price = State()
     max_price = State()
-    target_price = State()
 
 # ---------- DB ----------
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
         await db.execute("CREATE TABLE IF NOT EXISTS premium (id INTEGER PRIMARY KEY)")
-        await db.execute("CREATE TABLE IF NOT EXISTS fav (user INTEGER, link TEXT, title TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS alerts (user INTEGER, link TEXT, target REAL)")
         await db.commit()
 
 # ---------- HELPERS ----------
@@ -68,8 +65,6 @@ async def search(q, min_p=None, max_p=None):
 def menu_kb(prem, admin):
     kb = [
         [InlineKeyboardButton("🔍 Ara", callback_data="search")],
-        [InlineKeyboardButton("⭐ Favoriler", callback_data="fav")],
-        [InlineKeyboardButton("📊 Takipler", callback_data="alerts")]
     ]
     if not prem:
         kb.append([InlineKeyboardButton("💰 Reklam Kaldır", callback_data="premium")])
@@ -94,11 +89,11 @@ def product_kb(i, total, link):
         nav.append(InlineKeyboardButton("⬅️", callback_data="prev"))
     if i < total-1:
         nav.append(InlineKeyboardButton("➡️", callback_data="next"))
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton("🔗 Ürüne Git", url=link)],
-        nav,
-        [InlineKeyboardButton("🔙 Menü", callback_data="menu")]
-    ])
+    kb = [[InlineKeyboardButton("🔗 Ürüne Git", url=link)]]
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton("🔙 Menü", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 # ---------- START ----------
 @dp.message(Command("start"))
@@ -113,8 +108,7 @@ async def start(m: Message):
 @dp.callback_query(F.data == "menu")
 async def menu(cb: CallbackQuery):
     prem = await is_premium(cb.from_user.id)
-    await cb.message.delete()
-    await cb.message.answer("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
+    await cb.message.edit_text("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
     await cb.answer()
 
 # ---------- SEARCH FLOW ----------
