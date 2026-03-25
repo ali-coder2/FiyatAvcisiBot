@@ -150,7 +150,10 @@ async def show(cb, uid):
 # ========== START ==========
 
 @dp.message(Command("start"))
-async def start(m: Message):
+async def start(m: Message, state: FSMContext):
+    # State'i temizle - önemli!
+    await state.clear()
+    
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT OR IGNORE INTO users VALUES (?)", (m.from_user.id,))
         await db.commit()
@@ -162,7 +165,10 @@ async def start(m: Message):
 # ========== MENU ==========
 
 @dp.callback_query(F.data == "menu")
-async def menu(cb: CallbackQuery):
+async def menu(cb: CallbackQuery, state: FSMContext):
+    # State'i temizle
+    await state.clear()
+    
     prem = await is_premium(cb.from_user.id)
     await cb.message.delete()
     await cb.message.answer("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
@@ -172,23 +178,29 @@ async def menu(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "search")
 async def s(cb: CallbackQuery, state: FSMContext):
+    # Önce state'i temizle, sonra yeni state'e geç
+    await state.clear()
     await cb.message.edit_text("Ürün adı yaz:")
     await state.set_state(States.query)
     await cb.answer()
 
 @dp.message(States.query)
 async def q(m: Message, state: FSMContext):
+    # State'e query'yi kaydet
     await state.update_data(q=m.text)
+    # Butonları göster
     await m.answer("Seçim yap:", reply_markup=budget_choice_kb())
 
 @dp.callback_query(F.data.in_(["budget", "nofilter"]))
 async def search_type(cb: CallbackQuery, state: FSMContext):
+    # State verilerini al
     data = await state.get_data()
     query = data.get("q")
     
+    # Eğer query yoksa hata ver
     if not query:
-        await cb.message.edit_text("Önce ürün adı yazmalısınız.")
-        await state.set_state(States.query)
+        await cb.message.edit_text("Önce ürün adı yazmalısınız. /start ile yeniden başlayın.")
+        await state.clear()
         await cb.answer()
         return
 
@@ -196,15 +208,16 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
         await cb.message.edit_text("Minimum fiyat (TL) gir:")
         await state.set_state(States.min_price)
     else:  # nofilter
+        await cb.message.edit_text("Aranıyor...")
         res = await search(query)
         items = res.get("shopping_results", [])
         if not items:
             await cb.message.edit_text("Aradığınız ürün bulunamadı.", reply_markup=back_kb())
+            await state.clear()
             await cb.answer()
             return
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
-        msg = await cb.message.answer("Yükleniyor...")
-        await show(type("obj", (), {"message": msg}), cb.from_user.id)
+        await show(cb, cb.from_user.id)
         await state.clear()
     await cb.answer()
 
@@ -213,7 +226,7 @@ async def min_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("Sayı gir")
+        await m.answer("Lütfen geçerli bir sayı girin.")
         return
     await state.update_data(min=val)
     await m.answer("Maksimum fiyat (TL):")
@@ -224,22 +237,36 @@ async def max_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("Sayı gir")
+        await m.answer("Lütfen geçerli bir sayı girin.")
         return
 
     data = await state.get_data()
     min_val = data.get("min")
     query = data.get("q")
+    
+    if not query:
+        await m.answer("Bir hata oluştu. Lütfen /start ile yeniden başlayın.")
+        await state.clear()
+        return
+    
+    await m.answer("Aranıyor...")
     res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
 
     if not items:
-        await m.answer("Sonuç yok", reply_markup=back_kb())
+        await m.answer("Sonuç bulunamadı.", reply_markup=back_kb())
+        await state.clear()
         return
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
+    # Yeni mesaj gönder, show fonksiyonu için callback oluştur
     msg = await m.answer("Yükleniyor...")
-    await show(type("obj", (), {"message": msg}), m.from_user.id)
+    # Fake callback oluştur
+    class FakeCB:
+        def __init__(self, message):
+            self.message = message
+    fake_cb = FakeCB(msg)
+    await show(fake_cb, m.from_user.id)
     await state.clear()
 
 # ========== NAV ==========
@@ -311,7 +338,7 @@ async def set_price(m: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    p = data["p"]
+    p = data.get("p")
 
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT INTO alerts VALUES (?, ?, ?)",
