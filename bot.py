@@ -10,7 +10,11 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.utils.markdown import escape_md
+def escape_md(text: str) -> str:
+    if not text:
+        return ""
+    escape_chars = r"_*[]()~`>#+-=|{}.!"
+    return ''.join(['\\' + c if c in escape_chars else c for c in str(text)])
 from serpapi import GoogleSearch
 from dotenv import load_dotenv
 import os
