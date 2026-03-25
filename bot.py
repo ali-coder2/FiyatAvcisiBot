@@ -1,7 +1,7 @@
-import asyncio
 import os
 import random
 import string
+import asyncio
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -13,6 +13,7 @@ import aiosqlite
 from dotenv import load_dotenv
 
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -23,20 +24,20 @@ dp = Dispatcher(storage=MemoryStorage())
 DB = "db.sqlite"
 CACHE = {}
 
-# ---------- STATES ----------
+# ---------------- STATES ----------------
 class States(StatesGroup):
     query = State()
     min_price = State()
     max_price = State()
 
-# ---------- DB ----------
+# ---------------- DB INIT ----------------
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
         await db.execute("CREATE TABLE IF NOT EXISTS premium (id INTEGER PRIMARY KEY)")
         await db.commit()
 
-# ---------- HELPERS ----------
+# ---------------- HELPERS ----------------
 def ref_code(uid):
     return f"PREM-{uid}-" + ''.join(random.choices(string.ascii_uppercase, k=5))
 
@@ -61,11 +62,9 @@ async def search(q, min_p=None, max_p=None):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
 
-# ---------- KEYBOARDS ----------
+# ---------------- KEYBOARDS ----------------
 def menu_kb(prem, admin):
-    kb = [
-        [InlineKeyboardButton("🔍 Ara", callback_data="search")],
-    ]
+    kb = [[InlineKeyboardButton("🔍 Ara", callback_data="search")]]
     if not prem:
         kb.append([InlineKeyboardButton("💰 Reklam Kaldır", callback_data="premium")])
     else:
@@ -95,7 +94,7 @@ def product_kb(i, total, link):
     kb.append([InlineKeyboardButton("🔙 Menü", callback_data="menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-# ---------- START ----------
+# ---------------- START ----------------
 @dp.message(Command("start"))
 async def start(m: Message):
     async with aiosqlite.connect(DB) as db:
@@ -104,14 +103,14 @@ async def start(m: Message):
     prem = await is_premium(m.from_user.id)
     await m.answer("Hoş geldin!", reply_markup=menu_kb(prem, m.from_user.id == ADMIN_ID))
 
-# ---------- MENU ----------
+# ---------------- MENU ----------------
 @dp.callback_query(F.data == "menu")
 async def menu(cb: CallbackQuery):
     prem = await is_premium(cb.from_user.id)
     await cb.message.edit_text("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
     await cb.answer()
 
-# ---------- SEARCH FLOW ----------
+# ---------------- SEARCH FLOW ----------------
 @dp.callback_query(F.data == "search")
 async def search_start(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Ürün adı yaz:")
@@ -174,7 +173,7 @@ async def set_max_price(m: Message, state: FSMContext):
     res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
     if not items:
-        await m.answer("Sonuç yok")
+        await m.answer("Sonuç yok", reply_markup=back_kb())
         return
     CACHE[m.from_user.id] = {"data": items, "i": 0}
     item = items[0]
@@ -182,7 +181,7 @@ async def set_max_price(m: Message, state: FSMContext):
     await m.answer(text, reply_markup=product_kb(0, len(items), item.get("link")), parse_mode="Markdown")
     await state.clear()
 
-# ---------- NAV ----------
+# ---------------- NAV ----------------
 @dp.callback_query(F.data.in_(["next", "prev"]))
 async def nav(cb: CallbackQuery):
     c = CACHE.get(cb.from_user.id)
@@ -195,7 +194,7 @@ async def nav(cb: CallbackQuery):
     await cb.message.edit_text(text, reply_markup=product_kb(c["i"], len(c["data"]), item.get("link")), parse_mode="Markdown")
     await cb.answer()
 
-# ---------- PREMIUM ----------
+# ---------------- PREMIUM ----------------
 @dp.callback_query(F.data == "premium")
 async def premium(cb: CallbackQuery):
     code = ref_code(cb.from_user.id)
@@ -209,7 +208,7 @@ Referans Kodun:
     await cb.message.edit_text(text, parse_mode="Markdown")
     await cb.answer()
 
-# ---------- MAIN ----------
+# ---------------- MAIN ----------------
 async def main():
     await init_db()
     await dp.start_polling(bot)
