@@ -28,6 +28,8 @@ CACHE = {}
 # ---------- STATES ----------
 class States(StatesGroup):
     query = State()
+    min_price = State()
+    max_price = State()
     target_price = State()
     ref = State()
     ad = State()
@@ -50,16 +52,22 @@ async def is_premium(uid):
         async with db.execute("SELECT 1 FROM premium WHERE id=?", (uid,)) as c:
             return await c.fetchone() is not None
 
-async def search(q):
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, lambda: GoogleSearch({
+async def search(q, min_p=None, max_p=None):
+    params = {
         "api_key": SERPAPI_KEY,
         "engine": "google_shopping",
         "q": q,
         "hl": "tr",
         "gl": "tr",
         "num": 10
-    }).get_dict())
+    }
+    if min_p:
+        params["min_price"] = min_p
+    if max_p:
+        params["max_price"] = max_p
+
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
 
 # ---------- UI ----------
 def menu_kb(prem, admin):
@@ -77,7 +85,7 @@ def menu_kb(prem, admin):
         kb.append([InlineKeyboardButton(text="💳 Onay", callback_data="approve")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
-def product_kb(i, total):
+def product_kb(i, total, link):
     nav = []
     if i > 0:
         nav.append(InlineKeyboardButton(text="⬅️", callback_data="prev"))
@@ -85,6 +93,7 @@ def product_kb(i, total):
         nav.append(InlineKeyboardButton(text="➡️", callback_data="next"))
 
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Ürüne Git", url=link)],
         [InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}")],
         [InlineKeyboardButton(text="🔔 Takip", callback_data=f"track:{i}")],
         nav,
@@ -105,11 +114,27 @@ async def show(cb, uid):
     i = data["i"]
     p = data["data"][i]
 
-    text = f"**{p.get('title')}**\n💰 {p.get('price')}"
+    title = p.get("title")
+    price = p.get("price")
+    link = p.get("link")
+    img = p.get("thumbnail")
 
-    await cb.message.edit_text(text, parse_mode="Markdown",
-        reply_markup=product_kb(i, len(data["data"]))
-    )
+    text = f"**{title}**\n💰 {price}\n\n🔗 {link}"
+
+    try:
+        if img:
+            await cb.message.delete()
+            await cb.message.answer_photo(
+                photo=img,
+                caption=text,
+                parse_mode="Markdown",
+                reply_markup=product_kb(i, len(data["data"]), link)
+            )
+        else:
+            await cb.message.edit_text(text, parse_mode="Markdown",
+                reply_markup=product_kb(i, len(data["data"]), link))
+    except:
+        pass
 
 # ---------- START ----------
 @dp.message(Command("start"))
@@ -126,19 +151,44 @@ async def start(m: Message):
 @dp.callback_query(F.data == "menu")
 async def menu(cb: CallbackQuery):
     prem = await is_premium(cb.from_user.id)
-    await cb.message.edit_text("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
+    await cb.message.delete()
+    await cb.message.answer("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
     await cb.answer()
 
-# ---------- SEARCH ----------
+# ---------- SEARCH FLOW ----------
 @dp.callback_query(F.data == "search")
 async def s(cb: CallbackQuery, state: FSMContext):
-    await cb.message.edit_text("Ürün yaz:")
+    await cb.message.edit_text("Ürün adı yaz:")
     await state.set_state(States.query)
     await cb.answer()
 
 @dp.message(States.query)
 async def q(m: Message, state: FSMContext):
-    res = await search(m.text)
+    await state.update_data(q=m.text)
+    await m.answer("Minimum fiyat (TL):")
+    await state.set_state(States.min_price)
+
+@dp.message(States.min_price)
+async def min_p(m: Message, state: FSMContext):
+    try:
+        val = float(m.text)
+    except:
+        await m.answer("Sayı gir")
+        return
+    await state.update_data(min=val)
+    await m.answer("Maksimum fiyat (TL):")
+    await state.set_state(States.max_price)
+
+@dp.message(States.max_price)
+async def max_p(m: Message, state: FSMContext):
+    try:
+        val = float(m.text)
+    except:
+        await m.answer("Sayı gir")
+        return
+
+    data = await state.get_data()
+    res = await search(data["q"], data["min"], val)
     items = res.get("shopping_results", [])
 
     if not items:
@@ -182,11 +232,7 @@ async def fav(cb: CallbackQuery):
         async with db.execute("SELECT title FROM fav WHERE user=?", (cb.from_user.id,)) as c:
             rows = await c.fetchall()
 
-    if not rows:
-        txt = "Favorin yok"
-    else:
-        txt = "⭐ Favoriler:\n\n" + "\n".join([r[0] for r in rows])
-
+    txt = "Favorin yok" if not rows else "⭐ Favoriler:\n\n" + "\n".join([r[0] for r in rows])
     await cb.message.edit_text(txt, reply_markup=back_kb())
     await cb.answer()
 
@@ -197,13 +243,7 @@ async def alerts(cb: CallbackQuery):
         async with db.execute("SELECT link, target FROM alerts WHERE user=?", (cb.from_user.id,)) as c:
             rows = await c.fetchall()
 
-    if not rows:
-        txt = "Takip yok"
-    else:
-        txt = "📊 Takipler:\n\n"
-        for i, (link, target) in enumerate(rows):
-            txt += f"{i+1}. {target} TL\n"
-
+    txt = "Takip yok" if not rows else "📊 Takipler:\n\n" + "\n".join([f"{r[1]} TL" for r in rows])
     await cb.message.edit_text(txt, reply_markup=back_kb())
     await cb.answer()
 
@@ -252,12 +292,10 @@ IBAN:
 Referans Kodun:
 `{code}`
 
-📌 Yapman gereken:
 1. IBAN'a ödeme yap
-2. Açıklamaya bu kodu yaz
-3. Admin onaylayınca premium aktif
+2. Açıklamaya kodu yaz
+3. Onay sonrası premium aktif
 """
-
     await cb.message.edit_text(text, parse_mode="Markdown")
     await cb.answer()
 
