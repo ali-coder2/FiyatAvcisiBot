@@ -1,9 +1,7 @@
 import asyncio
-import json
-import hashlib
 import random
 import string
-from datetime import datetime, timedelta
+from datetime import datetime
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
@@ -22,80 +20,61 @@ SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
 IBAN = os.getenv("IBAN")
 
-PREMIUM_PRICE = 45
-AD_PRICE = 85
-BOT_NAME = "FiyatAvcısıBot"
-MY_TELEGRAM = "@Vortex2000"
-
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-DB_NAME = "shopping_bot.db"
-RESULTS_CACHE = {}
-
-# ---------- SAFE MARKDOWN ----------
-def escape_md(text: str) -> str:
-    if not text:
-        return ""
-    escape_chars = r"_*[]()~`>#+-=|{}.!"
-    return ''.join(['\\' + c if c in escape_chars else c for c in str(text)])
+DB = "db.sqlite"
+CACHE = {}
 
 # ---------- STATES ----------
-class SearchStates(StatesGroup):
-    waiting_query = State()
-    waiting_target_price = State()
-
-class AdminStates(StatesGroup):
-    waiting_ref = State()
-    waiting_ad = State()
+class States(StatesGroup):
+    query = State()
+    target_price = State()
+    ref = State()
+    ad = State()
 
 # ---------- DB ----------
 async def init_db():
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)")
-        await db.execute("CREATE TABLE IF NOT EXISTS premium (user_id INTEGER PRIMARY KEY)")
-        await db.execute("CREATE TABLE IF NOT EXISTS favorites (user_id INTEGER, link TEXT, title TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS alerts (user_id INTEGER, link TEXT, target REAL)")
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
+        await db.execute("CREATE TABLE IF NOT EXISTS premium (id INTEGER PRIMARY KEY)")
+        await db.execute("CREATE TABLE IF NOT EXISTS fav (user INTEGER, link TEXT, title TEXT)")
+        await db.execute("CREATE TABLE IF NOT EXISTS alerts (user INTEGER, link TEXT, target REAL)")
         await db.commit()
 
 # ---------- HELPERS ----------
-def gen_ref(prefix, user_id):
-    return f"{prefix}-{user_id}-" + ''.join(random.choices(string.ascii_uppercase, k=5))
+def ref_code(uid):
+    return f"PREM-{uid}-" + ''.join(random.choices(string.ascii_uppercase, k=5))
 
-async def is_premium(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT 1 FROM premium WHERE user_id=?", (user_id,)) as c:
+async def is_premium(uid):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT 1 FROM premium WHERE id=?", (uid,)) as c:
             return await c.fetchone() is not None
 
-async def set_premium(user_id):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute("INSERT OR IGNORE INTO premium VALUES (?)", (user_id,))
-        await db.commit()
-
-async def search_products(query):
+async def search(q):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: GoogleSearch({
         "api_key": SERPAPI_KEY,
         "engine": "google_shopping",
-        "q": query,
+        "q": q,
         "hl": "tr",
         "gl": "tr",
         "num": 10
     }).get_dict())
 
 # ---------- UI ----------
-def menu_kb(is_prem, is_admin):
+def menu_kb(prem, admin):
     kb = [
         [InlineKeyboardButton(text="🔍 Ara", callback_data="search")],
         [InlineKeyboardButton(text="⭐ Favoriler", callback_data="fav")]
     ]
-    if not is_prem:
+    if not prem:
         kb.append([InlineKeyboardButton(text="💰 Reklam Kaldır", callback_data="premium")])
     else:
         kb.append([InlineKeyboardButton(text="✅ Premium", callback_data="noop")])
-    if is_admin:
-        kb.append([InlineKeyboardButton(text="📢 Reklam Gönder", callback_data="send_ad")])
-        kb.append([InlineKeyboardButton(text="💳 Ödeme Onayla", callback_data="approve")])
+    if admin:
+        kb.append([InlineKeyboardButton(text="📢 Reklam", callback_data="ad")])
+        kb.append([InlineKeyboardButton(text="💳 Onay", callback_data="approve")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def product_kb(i, total):
@@ -112,115 +91,174 @@ def product_kb(i, total):
         [InlineKeyboardButton(text="🔙 Menü", callback_data="menu")]
     ])
 
-# ---------- SHOW PRODUCT ----------
-async def show_product(msg, user_id):
-    cache = RESULTS_CACHE.get(user_id)
-    if not cache:
+# ---------- SHOW ----------
+async def show(cb, uid):
+    data = CACHE.get(uid)
+    if not data:
         return
 
-    i = cache["i"]
-    product = cache["data"][i]
+    i = data["i"]
+    p = data["data"][i]
 
-    title = escape_md(product.get("title"))
-    price = product.get("price", "Yok")
-    source = escape_md(product.get("source", ""))
+    text = f"**{p.get('title')}**\n💰 {p.get('price')}"
 
-    text = f"**{title}**\n💰 {price}\n🏪 {source}"
-
-    try:
-        await msg.edit_text(text, reply_markup=product_kb(i, len(cache["data"])), parse_mode="Markdown")
-    except:
-        await msg.answer(text, reply_markup=product_kb(i, len(cache["data"])), parse_mode="Markdown")
+    await cb.message.edit_text(text, parse_mode="Markdown",
+        reply_markup=product_kb(i, len(data["data"]))
+    )
 
 # ---------- START ----------
 @dp.message(Command("start"))
 async def start(m: Message):
-    async with aiosqlite.connect(DB_NAME) as db:
+    async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT OR IGNORE INTO users VALUES (?)", (m.from_user.id,))
         await db.commit()
 
     prem = await is_premium(m.from_user.id)
 
-    await m.answer(
-        "Hoş geldin!",
-        reply_markup=menu_kb(prem, m.from_user.id == ADMIN_ID)
-    )
+    await m.answer("Hoş geldin!", reply_markup=menu_kb(prem, m.from_user.id == ADMIN_ID))
 
 # ---------- SEARCH ----------
 @dp.callback_query(F.data == "search")
-async def search(cb: CallbackQuery, state: FSMContext):
+async def s(cb: CallbackQuery, state: FSMContext):
     await cb.message.edit_text("Ürün yaz:")
-    await state.set_state(SearchStates.waiting_query)
+    await state.set_state(States.query)
     await cb.answer()
 
-@dp.message(SearchStates.waiting_query)
-async def do_search(m: Message, state: FSMContext):
-    res = await search_products(m.text)
+@dp.message(States.query)
+async def q(m: Message, state: FSMContext):
+    res = await search(m.text)
     items = res.get("shopping_results", [])
 
-    RESULTS_CACHE[m.from_user.id] = {"data": items, "i": 0}
+    if not items:
+        await m.answer("Sonuç yok")
+        return
 
-    await show_product(m, m.from_user.id)
+    CACHE[m.from_user.id] = {"data": items, "i": 0}
+
+    msg = await m.answer("Yükleniyor...")
+    await show(type("obj", (), {"message": msg}), m.from_user.id)
+
     await state.clear()
 
 # ---------- NAV ----------
 @dp.callback_query(F.data.in_(["next", "prev"]))
 async def nav(cb: CallbackQuery):
-    cache = RESULTS_CACHE.get(cb.from_user.id)
-    if not cache:
+    c = CACHE.get(cb.from_user.id)
+    if not c:
         return
 
-    if cb.data == "next":
-        cache["i"] += 1
+    c["i"] += 1 if cb.data == "next" else -1
+    await show(cb, cb.from_user.id)
+    await cb.answer()
+
+# ---------- FAVORİ ----------
+@dp.callback_query(F.data.startswith("fav_add:"))
+async def fav_add(cb: CallbackQuery):
+    i = int(cb.data.split(":")[1])
+    p = CACHE[cb.from_user.id]["data"][i]
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO fav VALUES (?, ?, ?)",
+                         (cb.from_user.id, p.get("link"), p.get("title")))
+        await db.commit()
+
+    await cb.answer("Eklendi")
+
+@dp.callback_query(F.data == "fav")
+async def fav(cb: CallbackQuery):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT title FROM fav WHERE user=?", (cb.from_user.id,)) as c:
+            rows = await c.fetchall()
+
+    if not rows:
+        await cb.message.edit_text("Favorin yok")
     else:
-        cache["i"] -= 1
+        txt = "\n".join([r[0] for r in rows])
+        await cb.message.edit_text(f"⭐ Favoriler:\n\n{txt}")
 
-    await show_product(cb.message, cb.from_user.id)
     await cb.answer()
 
-# ---------- MENU BACK ----------
-@dp.callback_query(F.data == "menu")
-async def menu(cb: CallbackQuery):
-    prem = await is_premium(cb.from_user.id)
-    await cb.message.edit_text("Menü", reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID))
+# ---------- TAKİP ----------
+@dp.callback_query(F.data.startswith("track:"))
+async def track(cb: CallbackQuery, state: FSMContext):
+    i = int(cb.data.split(":")[1])
+    p = CACHE[cb.from_user.id]["data"][i]
+
+    await state.update_data(p=p)
+    await cb.message.answer("Hedef fiyat gir:")
+    await state.set_state(States.target_price)
     await cb.answer()
+
+@dp.message(States.target_price)
+async def set_price(m: Message, state: FSMContext):
+    try:
+        price = float(m.text)
+    except:
+        await m.answer("Sayı gir")
+        return
+
+    data = await state.get_data()
+    p = data["p"]
+
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO alerts VALUES (?, ?, ?)",
+                         (m.from_user.id, p.get("link"), price))
+        await db.commit()
+
+    await m.answer("Takip başlatıldı")
+    await state.clear()
 
 # ---------- PREMIUM ----------
 @dp.callback_query(F.data == "premium")
-async def premium(cb: CallbackQuery):
-    ref = gen_ref("PREM", cb.from_user.id)
-    await cb.message.edit_text(
-        f"{PREMIUM_PRICE} TL\nIBAN: {IBAN}\nKod: {ref}"
-    )
+async def prem(cb: CallbackQuery):
+    code = ref_code(cb.from_user.id)
+
+    text = f"""💰 Premium (Reklamsız)
+
+Ücret: 45 TL
+IBAN: {IBAN}
+
+Referans Kodun:
+`{code}`
+
+📌 Yapman gereken:
+1. IBAN'a ödeme yap
+2. Açıklamaya bu kodu yaz
+3. Admin onaylayınca premium aktif
+"""
+
+    await cb.message.edit_text(text, parse_mode="Markdown")
     await cb.answer()
 
-# ---------- APPROVE ----------
+# ---------- ONAY ----------
 @dp.callback_query(F.data == "approve")
 async def approve(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("Ref kod gir:")
-    await state.set_state(AdminStates.waiting_ref)
+    await cb.message.answer("Kod gir:")
+    await state.set_state(States.ref)
     await cb.answer()
 
-@dp.message(AdminStates.waiting_ref)
-async def do_approve(m: Message, state: FSMContext):
-    ref = m.text
-    if ref.startswith("PREM-"):
-        user_id = int(ref.split("-")[1])
-        await set_premium(user_id)
+@dp.message(States.ref)
+async def ok(m: Message, state: FSMContext):
+    if m.text.startswith("PREM-"):
+        uid = int(m.text.split("-")[1])
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT OR IGNORE INTO premium VALUES (?)", (uid,))
+            await db.commit()
         await m.answer("Onaylandı")
+
     await state.clear()
 
 # ---------- REKLAM ----------
-@dp.callback_query(F.data == "send_ad")
-async def send_ad(cb: CallbackQuery, state: FSMContext):
+@dp.callback_query(F.data == "ad")
+async def ad(cb: CallbackQuery, state: FSMContext):
     await cb.message.answer("Reklam yaz:")
-    await state.set_state(AdminStates.waiting_ad)
+    await state.set_state(States.ad)
     await cb.answer()
 
-@dp.message(AdminStates.waiting_ad)
-async def broadcast(m: Message, state: FSMContext):
-    async with aiosqlite.connect(DB_NAME) as db:
-        async with db.execute("SELECT user_id FROM users") as c:
+@dp.message(States.ad)
+async def send_ad(m: Message, state: FSMContext):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT id FROM users") as c:
             users = await c.fetchall()
 
     for (uid,) in users:
