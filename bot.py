@@ -33,7 +33,6 @@ class States(StatesGroup):
     target_price = State()
     ref = State()
     ad = State()
-    search_type = State()
 
 # ---------- DB ----------
 async def init_db():
@@ -106,7 +105,7 @@ def back_kb():
         [InlineKeyboardButton(text="🔙 Menü", callback_data="menu")]
     ])
 
-def budget_kb():
+def budget_choice_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Bütçe Belirle", callback_data="budget")],
         [InlineKeyboardButton(text="Filtresiz", callback_data="nofilter")]
@@ -172,17 +171,23 @@ async def s(cb: CallbackQuery, state: FSMContext):
 @dp.message(States.query)
 async def q(m: Message, state: FSMContext):
     await state.update_data(q=m.text)
-    await m.answer("Arama türünü seç:", reply_markup=budget_kb())
-    await state.set_state(States.search_type)
+    await m.answer("Seçim yap:", reply_markup=budget_choice_kb())
 
 @dp.callback_query(F.data.in_(["budget", "nofilter"]))
 async def search_type(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
+    query = data.get("q")
+    if not query:
+        await cb.message.edit_text("Önce ürün adı yazmalısınız.")
+        await state.set_state(States.query)
+        await cb.answer()
+        return
+
     if cb.data == "budget":
         await cb.message.edit_text("Minimum fiyat (TL) gir:")
         await state.set_state(States.min_price)
     else:  # nofilter
-        res = await search(data["q"])
+        res = await search(query)
         items = res.get("shopping_results", [])
         if not items:
             await cb.message.edit_text("Aradığınız ürün bulunamadı.", reply_markup=back_kb())
@@ -199,10 +204,10 @@ async def min_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("Lütfen sayı gir")
+        await m.answer("Sayı gir")
         return
     await state.update_data(min=val)
-    await m.answer("Maksimum fiyat (TL) gir:")
+    await m.answer("Maksimum fiyat (TL):")
     await state.set_state(States.max_price)
 
 @dp.message(States.max_price)
@@ -210,16 +215,17 @@ async def max_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("Lütfen sayı gir")
+        await m.answer("Sayı gir")
         return
 
     data = await state.get_data()
-    res = await search(data["q"], data["min"], val)
+    min_val = data.get("min")
+    query = data.get("q")
+    res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
 
     if not items:
-        await m.answer("Aradığınız kriterlere uygun ürün bulunamadı.", reply_markup=back_kb())
-        await state.clear()
+        await m.answer("Sonuç yok")
         return
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
@@ -288,7 +294,7 @@ async def set_price(m: Message, state: FSMContext):
     try:
         price = float(m.text)
     except:
-        await m.answer("Lütfen sayı gir")
+        await m.answer("Sayı gir")
         return
 
     data = await state.get_data()
