@@ -65,7 +65,6 @@ async def search(q, min_p=None, max_p=None):
         params["min_price"] = min_p
     if max_p is not None:
         params["max_price"] = max_p
-
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
 
@@ -91,7 +90,6 @@ def product_kb(i, total, link):
         nav.append(InlineKeyboardButton(text="⬅️", callback_data="prev"))
     if i < total-1:
         nav.append(InlineKeyboardButton(text="➡️", callback_data="next"))
-
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Ürüne Git", url=link)],
         [InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}")],
@@ -101,9 +99,7 @@ def product_kb(i, total, link):
     ])
 
 def back_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔙 Menü", callback_data="menu")]
-    ])
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Menü", callback_data="menu")]])
 
 def budget_choice_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -114,36 +110,25 @@ def budget_choice_kb():
 # ---------- SHOW ----------
 async def show(cb, uid):
     data = CACHE.get(uid)
-    if not data:
+    if not data or not data.get("data"):
+        await cb.message.answer("Ürün verisi yok", reply_markup=back_kb())
         return
-
-    i = data["i"]
-    i = max(0, min(i, len(data["data"]) - 1))
+    i = data.get("i", 0)
+    i = max(0, min(i, len(data["data"])-1))
     data["i"] = i
-
     p = data["data"][i]
-
     title = p.get("title")
     price = p.get("price")
     link = p.get("link")
     img = p.get("thumbnail")
-
     text = f"**{title}**\n💰 {price}\n\n🔗 {link}"
-
     try:
         if img:
-            await cb.message.answer_photo(
-                photo=img,
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=product_kb(i, len(data["data"]), link)
-            )
+            await cb.message.answer_photo(photo=img, caption=text, parse_mode="Markdown",
+                                          reply_markup=product_kb(i, len(data["data"]), link))
         else:
-            await cb.message.edit_text(
-                text,
-                parse_mode="Markdown",
-                reply_markup=product_kb(i, len(data["data"]), link)
-            )
+            await cb.message.edit_text(text, parse_mode="Markdown",
+                                       reply_markup=product_kb(i, len(data["data"]), link))
     except:
         pass
 
@@ -153,9 +138,7 @@ async def start(m: Message):
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT OR IGNORE INTO users VALUES (?)", (m.from_user.id,))
         await db.commit()
-
     prem = await is_premium(m.from_user.id)
-
     await m.answer("Hoş geldin!", reply_markup=menu_kb(prem, m.from_user.id == ADMIN_ID))
 
 # ---------- MENU ----------
@@ -175,46 +158,31 @@ async def s(cb: CallbackQuery, state: FSMContext):
 @dp.message(States.query)
 async def q(m: Message, state: FSMContext):
     await state.update_data(q=m.text)
-
-    # 🔥 backup fix
-    CACHE[m.from_user.id] = {"query": m.text}
-
+    CACHE[m.from_user.id] = {"query": m.text}  # backup
     await m.answer("Seçim yap:", reply_markup=budget_choice_kb())
 
 @dp.callback_query(F.data.in_(["budget", "nofilter"]))
 async def search_type(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-
-    query = data.get("q")
-
-    # 🔥 fallback fix
-    if not query:
-        query = CACHE.get(cb.from_user.id, {}).get("query")
-
+    query = data.get("q") or CACHE.get(cb.from_user.id, {}).get("query")
     if not query:
         await cb.message.edit_text("Önce ürün adı yazmalısınız.")
         await state.set_state(States.query)
         return
-
     if cb.data == "budget":
         await cb.message.edit_text("Minimum fiyat (TL) gir:")
         await state.set_state(States.min_price)
-
     else:
         res = await search(query)
         items = res.get("shopping_results", [])
-
         if not items:
             await cb.message.edit_text("Ürün bulunamadı.", reply_markup=back_kb())
             return
-
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
         await show(cb, cb.from_user.id)
         await state.clear()
-
     await cb.answer()
 
-# ---------- MIN ----------
 @dp.message(States.min_price)
 async def min_p(m: Message, state: FSMContext):
     try:
@@ -222,12 +190,10 @@ async def min_p(m: Message, state: FSMContext):
     except:
         await m.answer("Sayı gir")
         return
-
     await state.update_data(min=val)
     await m.answer("Maksimum fiyat (TL):")
     await state.set_state(States.max_price)
 
-# ---------- MAX ----------
 @dp.message(States.max_price)
 async def max_p(m: Message, state: FSMContext):
     try:
@@ -235,22 +201,16 @@ async def max_p(m: Message, state: FSMContext):
     except:
         await m.answer("Sayı gir")
         return
-
     data = await state.get_data()
-
     query = data.get("q") or CACHE.get(m.from_user.id, {}).get("query")
-
-    res = await search(query, data.get("min"), val)
+    min_val = data.get("min")
+    res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
-
     if not items:
         await m.answer("Sonuç yok")
         return
-
     CACHE[m.from_user.id] = {"data": items, "i": 0}
-    msg = await m.answer("Yükleniyor...")
-    await show(type("obj", (), {"message": msg}), m.from_user.id)
-
+    await show(type("obj", (), {"message": m}), m.from_user.id)
     await state.clear()
 
 # ---------- NAV ----------
@@ -259,18 +219,34 @@ async def nav(cb: CallbackQuery):
     c = CACHE.get(cb.from_user.id)
     if not c:
         return
-
     c["i"] += 1 if cb.data == "next" else -1
+    c["i"] = max(0, min(c["i"], len(c.get("data", []))-1))
     await show(cb, cb.from_user.id)
+    await cb.answer()
+
+# ---------- FAVORİ ----------
+@dp.callback_query(F.data.startswith("fav_add:"))
+async def fav_add(cb: CallbackQuery):
+    i = int(cb.data.split(":")[1])
+    p = CACHE[cb.from_user.id]["data"][i]
+    async with aiosqlite.connect(DB) as db:
+        await db.execute("INSERT INTO fav VALUES (?, ?, ?)", (cb.from_user.id, p.get("link"), p.get("title")))
+        await db.commit()
+    await cb.answer("Eklendi")
+
+@dp.callback_query(F.data == "fav")
+async def fav(cb: CallbackQuery):
+    async with aiosqlite.connect(DB) as db:
+        async with db.execute("SELECT title FROM fav WHERE user=?", (cb.from_user.id,)) as c:
+            rows = await c.fetchall()
+    txt = "Favorin yok" if not rows else "⭐ Favoriler:\n\n" + "\n".join([r[0] for r in rows])
+    await cb.message.edit_text(txt, reply_markup=back_kb())
     await cb.answer()
 
 # ---------- MAIN ----------
 async def main():
     await init_db()
-
-    # 🔥 conflict fix
     await bot.delete_webhook(drop_pending_updates=True)
-
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
