@@ -10,7 +10,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from google_search_results import GoogleSearch
+from serpapi import GoogleSearch
 from dotenv import load_dotenv
 import os
 import aiosqlite
