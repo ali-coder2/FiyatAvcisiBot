@@ -143,7 +143,7 @@ async def check_price_drops():
             for alert in alerts:
                 user_id, link, title, old_price_str, target_price = alert
                 
-                # Ürünü tekrar ara (link üzerinden doğrudan erişim yok, title ile arama yap)
+                # Ürünü tekrar ara
                 res = await search(title)
                 items = res.get("shopping_results", [])
                 
@@ -249,10 +249,11 @@ def budget_choice_kb():
 
 # ========== SHOW ==========
 
-async def show_product(message, uid, edit=True):
+async def show_product(message, uid, is_callback=False):
+    """Ürün göster - fotoğraf varsa silip yeni gönder, yoksa edit et"""
     data = CACHE.get(uid)
     if not data or not data["data"]:
-        if edit:
+        if is_callback:
             await message.edit_text("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
         else:
             await message.answer("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
@@ -279,8 +280,13 @@ async def show_product(message, uid, edit=True):
     markup = product_kb(i, len(data["data"]), link)
 
     try:
-        if img and not edit:
-            # İlk gösterim ve fotoğraf varsa
+        if img:
+            # Fotoğraf varsa her zaman silip yeni gönder (edit edilemez çünkü)
+            if is_callback:
+                try:
+                    await message.delete()
+                except:
+                    pass
             await message.answer_photo(
                 photo=img,
                 caption=text,
@@ -288,14 +294,17 @@ async def show_product(message, uid, edit=True):
                 reply_markup=markup
             )
         else:
-            # Edit mod veya fotoğraf yoksa
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            # Fotoğraf yoksa edit et
+            if is_callback:
+                await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await message.answer(text, parse_mode="Markdown", reply_markup=markup)
     except Exception as e:
         print(f"Show hatası: {e}")
         try:
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
-        except:
             await message.answer(text, parse_mode="Markdown", reply_markup=markup)
+        except:
+            pass
 
 # ========== START ==========
 
@@ -369,8 +378,8 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
             return
         
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
-        # İlk gösterim - edit=False çünkü "Aranıyor..." mesajını düzenleyemeyiz (fotoğraf varsa)
-        await show_product(cb.message, cb.from_user.id, edit=False)
+        # İlk gösterim - callback mesajı üzerinden
+        await show_product(cb.message, cb.from_user.id, is_callback=True)
         await state.clear()
     
     await cb.answer()
@@ -417,8 +426,8 @@ async def max_p(m: Message, state: FSMContext):
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
     
-    # İlk gösterim
-    await show_product(loading_msg, m.from_user.id, edit=False)
+    # İlk gösterim - normal mesaj
+    await show_product(loading_msg, m.from_user.id, is_callback=False)
     await state.clear()
 
 # ========== NAV ==========
@@ -440,8 +449,8 @@ async def nav(cb: CallbackQuery):
     if c["i"] >= len(c["data"]):
         c["i"] = len(c["data"]) - 1
     
-    # edit=True - mesajı düzenle, silme
-    await show_product(cb.message, cb.from_user.id, edit=True)
+    # Her zaman silip yeni gönder (fotoğraf varsa edit edilemez)
+    await show_product(cb.message, cb.from_user.id, is_callback=True)
     await cb.answer()
 
 # ========== FAVORİ ==========
@@ -571,16 +580,6 @@ async def noop(cb: CallbackQuery):
     await cb.answer("Zaten premium üyesiniz!")
 
 # ========== ADMIN - REKLAM ==========
-
-@dp.callback_query(F.data == "ad")
-async def ad_start(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_ID:
-        await cb.answer("Yetkiniz yok!")
-        return
-    
-    await cb.message.edit_text("📢 Reklam mesajını yazın:\n\n(Vazgeçmek için /cancel yazın)")
-    await state.set_state(States.ad)
-    await cb.answer()
 
 @dp.message(States.ad)
 async def ad_send(m: Message, state: FSMContext):
