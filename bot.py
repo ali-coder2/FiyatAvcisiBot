@@ -11,6 +11,7 @@ from serpapi import GoogleSearch
 from dotenv import load_dotenv
 import os
 import aiosqlite
+import re
 
 load_dotenv()
 
@@ -41,8 +42,21 @@ async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
         await db.execute("CREATE TABLE IF NOT EXISTS premium (id INTEGER PRIMARY KEY)")
-        await db.execute("CREATE TABLE IF NOT EXISTS fav (user INTEGER, link TEXT, title TEXT)")
-        await db.execute("CREATE TABLE IF NOT EXISTS alerts (user INTEGER, link TEXT, target REAL)")
+        await db.execute("""CREATE TABLE IF NOT EXISTS fav (
+            user INTEGER, 
+            link TEXT, 
+            title TEXT,
+            price TEXT,
+            UNIQUE(user, link)
+        )""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS alerts (
+            user INTEGER, 
+            link TEXT, 
+            title TEXT,
+            current_price TEXT,
+            target_price REAL,
+            UNIQUE(user, link)
+        )""")
         await db.commit()
 
 # ========== HELPERS ==========
@@ -55,6 +69,19 @@ async def is_premium(uid):
         async with db.execute("SELECT 1 FROM premium WHERE id=?", (uid,)) as c:
             return await c.fetchone() is not None
 
+def extract_price(price_str):
+    """Fiyat stringinden sayı çıkar"""
+    if not price_str:
+        return None
+    numbers = re.findall(r'[\d.,]+', str(price_str))
+    if numbers:
+        num = numbers[0].replace('.', '').replace(',', '.')
+        try:
+            return float(num)
+        except:
+            return None
+    return None
+
 async def search(q, min_p=None, max_p=None):
     params = {
         "api_key": SERPAPI_KEY,
@@ -65,7 +92,6 @@ async def search(q, min_p=None, max_p=None):
         "num": 10
     }
     
-    # Fiyat filtreleri - Google Shopping'de price_min ve price_max kullanılır
     if min_p is not None:
         params["price_min"] = str(int(min_p))
     if max_p is not None:
@@ -76,12 +102,8 @@ async def search(q, min_p=None, max_p=None):
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
-        print(f"API Yanıtı tamamı: {result}")
         
-        # Farklı yanıt yapısını kontrol et
         shopping_results = result.get("shopping_results", [])
-        
-        # Eğer shopping_results yoksa, inline_shopping_results veya sponsored_results dene
         if not shopping_results:
             shopping_results = result.get("inline_shopping_results", [])
         if not shopping_results:
@@ -89,7 +111,6 @@ async def search(q, min_p=None, max_p=None):
             
         print(f"Bulunan sonuç sayısı: {len(shopping_results)}")
         
-        # Sonuçları normalize et
         normalized_results = []
         for item in shopping_results:
             normalized_item = {
@@ -108,6 +129,72 @@ async def search(q, min_p=None, max_p=None):
         import traceback
         traceback.print_exc()
         return {"shopping_results": []}
+
+# ========== FİYAT KONTROLÜ (SCHEDULER) ==========
+
+async def check_price_drops():
+    """Belirli aralıklarla takipteki ürünlerin fiyatlarını kontrol et"""
+    while True:
+        try:
+            async with aiosqlite.connect(DB) as db:
+                async with db.execute("SELECT user, link, title, current_price, target_price FROM alerts") as c:
+                    alerts = await c.fetchall()
+            
+            for alert in alerts:
+                user_id, link, title, old_price_str, target_price = alert
+                
+                # Ürünü tekrar ara (link üzerinden doğrudan erişim yok, title ile arama yap)
+                res = await search(title)
+                items = res.get("shopping_results", [])
+                
+                # Aynı linki bul
+                current_item = None
+                for item in items:
+                    if item.get("link") == link:
+                        current_item = item
+                        break
+                
+                if current_item:
+                    current_price_str = current_item.get("price", "Fiyat yok")
+                    current_price_val = extract_price(current_price_str)
+                    
+                    # Veritabanını güncelle
+                    async with aiosqlite.connect(DB) as db:
+                        await db.execute(
+                            "UPDATE alerts SET current_price = ? WHERE user = ? AND link = ?",
+                            (current_price_str, user_id, link)
+                        )
+                        await db.commit()
+                    
+                    # Fiyat hedefin altına düştü mü?
+                    if current_price_val and current_price_val <= target_price:
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"🎉 **Fiyat Düştü!**\n\n"
+                                f"📦 {title}\n"
+                                f"💰 Eski: {old_price_str}\n"
+                                f"💰 Yeni: {current_price_str}\n"
+                                f"🎯 Hedef: {target_price} TL\n\n"
+                                f"🔗 [Ürüne Git]({link})",
+                                parse_mode="Markdown"
+                            )
+                            # Bildirim gönderildi, takipten çıkar
+                            async with aiosqlite.connect(DB) as db:
+                                await db.execute(
+                                    "DELETE FROM alerts WHERE user = ? AND link = ?",
+                                    (user_id, link)
+                                )
+                                await db.commit()
+                        except:
+                            pass
+            
+            # 30 dakika bekle
+            await asyncio.sleep(1800)
+            
+        except Exception as e:
+            print(f"Fiyat kontrol hatası: {e}")
+            await asyncio.sleep(300)
 
 # ========== UI ==========
 
@@ -162,14 +249,20 @@ def budget_choice_kb():
 
 # ========== SHOW ==========
 
-async def show_product(message, uid):
+async def show_product(message, uid, edit=True):
     data = CACHE.get(uid)
     if not data or not data["data"]:
-        await message.edit_text("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
+        if edit:
+            await message.edit_text("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
+        else:
+            await message.answer("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
         return
 
     i = data["i"]
     if i >= len(data["data"]):
+        i = 0
+        data["i"] = 0    
+    if i < 0:
         i = 0
         data["i"] = 0
     
@@ -186,8 +279,8 @@ async def show_product(message, uid):
     markup = product_kb(i, len(data["data"]), link)
 
     try:
-        if img:
-            await message.delete()
+        if img and not edit:
+            # İlk gösterim ve fotoğraf varsa
             await message.answer_photo(
                 photo=img,
                 caption=text,
@@ -195,6 +288,7 @@ async def show_product(message, uid):
                 reply_markup=markup
             )
         else:
+            # Edit mod veya fotoğraf yoksa
             await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
     except Exception as e:
         print(f"Show hatası: {e}")
@@ -275,7 +369,8 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
             return
         
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
-        await show_product(cb.message, cb.from_user.id)
+        # İlk gösterim - edit=False çünkü "Aranıyor..." mesajını düzenleyemeyiz (fotoğraf varsa)
+        await show_product(cb.message, cb.from_user.id, edit=False)
         await state.clear()
     
     await cb.answer()
@@ -322,13 +417,8 @@ async def max_p(m: Message, state: FSMContext):
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
     
-    try:
-        await loading_msg.delete()
-    except:
-        pass
-    
-    await m.answer("🔍 Sonuçlar bulundu!")
-    await show_product(loading_msg, m.from_user.id)
+    # İlk gösterim
+    await show_product(loading_msg, m.from_user.id, edit=False)
     await state.clear()
 
 # ========== NAV ==========
@@ -350,7 +440,8 @@ async def nav(cb: CallbackQuery):
     if c["i"] >= len(c["data"]):
         c["i"] = len(c["data"]) - 1
     
-    await show_product(cb.message, cb.from_user.id)
+    # edit=True - mesajı düzenle, silme
+    await show_product(cb.message, cb.from_user.id, edit=True)
     await cb.answer()
 
 # ========== FAVORİ ==========
@@ -361,20 +452,34 @@ async def fav_add(cb: CallbackQuery):
     p = CACHE[cb.from_user.id]["data"][i]
 
     async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT INTO fav VALUES (?, ?, ?)",
-                         (cb.from_user.id, p.get("link"), p.get("title")))
-        await db.commit()
-
-    await cb.answer("✅ Favorilere eklendi")
+        try:
+            await db.execute(
+                "INSERT INTO fav (user, link, title, price) VALUES (?, ?, ?, ?)",
+                (cb.from_user.id, p.get("link"), p.get("title"), p.get("price"))
+            )
+            await db.commit()
+            await cb.answer("✅ Favorilere eklendi")
+        except:
+            await cb.answer("❌ Zaten favorilerde")
 
 @dp.callback_query(F.data == "fav")
 async def fav(cb: CallbackQuery):
     async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT title FROM fav WHERE user=?", (cb.from_user.id,)) as c:
+        async with db.execute(
+            "SELECT title, link, price FROM fav WHERE user=?", 
+            (cb.from_user.id,)
+        ) as c:
             rows = await c.fetchall()
 
-    txt = "⭐ Favorin yok" if not rows else "⭐ Favoriler:\n\n" + "\n".join([f"• {r[0]}" for r in rows])
-    await cb.message.edit_text(txt, reply_markup=back_kb())
+    if not rows:
+        txt = "⭐ Favorin yok"
+    else:
+        txt = "⭐ Favorilerin:\n\n"
+        for idx, row in enumerate(rows, 1):
+            title, link, price = row
+            txt += f"{idx}. **{title}**\n💰 {price}\n🔗 [Ürüne Git]({link})\n\n"
+    
+    await cb.message.edit_text(txt, parse_mode="Markdown", reply_markup=back_kb())
     await cb.answer()
 
 # ========== TAKİPLER ==========
@@ -382,11 +487,24 @@ async def fav(cb: CallbackQuery):
 @dp.callback_query(F.data == "alerts")
 async def alerts(cb: CallbackQuery):
     async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT link, target FROM alerts WHERE user=?", (cb.from_user.id,)) as c:
+        async with db.execute(
+            "SELECT title, link, current_price, target_price FROM alerts WHERE user=?", 
+            (cb.from_user.id,)
+        ) as c:
             rows = await c.fetchall()
 
-    txt = "📊 Takip yok" if not rows else "📊 Takipler:\n\n" + "\n".join([f"• Hedef: {r[1]} TL" for r in rows])
-    await cb.message.edit_text(txt, reply_markup=back_kb())
+    if not rows:
+        txt = "📊 Takip ettiğin ürün yok"
+    else:
+        txt = "📊 Takip Ettiğin Ürünler:\n\n"
+        for idx, row in enumerate(rows, 1):
+            title, link, current_price, target_price = row
+            txt += (f"{idx}. **{title}**\n"
+                   f"💰 Şu anki: {current_price}\n"
+                   f"🎯 Hedef: {target_price} TL\n"
+                   f"🔗 [Ürüne Git]({link})\n\n")
+    
+    await cb.message.edit_text(txt, parse_mode="Markdown", reply_markup=back_kb())
     await cb.answer()
 
 # ========== TAKİP EKLE ==========
@@ -404,7 +522,7 @@ async def track(cb: CallbackQuery, state: FSMContext):
 @dp.message(States.target_price)
 async def set_price(m: Message, state: FSMContext):
     try:
-        price = float(m.text)
+        target_price = float(m.text)
     except:
         await m.answer("❌ Lütfen geçerli bir sayı girin.")
         return
@@ -413,11 +531,16 @@ async def set_price(m: Message, state: FSMContext):
     p = data.get("p")
 
     async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT INTO alerts VALUES (?, ?, ?)",
-                         (m.from_user.id, p.get("link"), price))
-        await db.commit()
+        try:
+            await db.execute(
+                "INSERT INTO alerts (user, link, title, current_price, target_price) VALUES (?, ?, ?, ?, ?)",
+                (m.from_user.id, p.get("link"), p.get("title"), p.get("price"), target_price)
+            )
+            await db.commit()
+            await m.answer(f"✅ Takip başlatıldı!\n\nÜrün: {p.get('title')}\nHedef: {target_price} TL")
+        except:
+            await m.answer("❌ Bu ürün zaten takipte")
 
-    await m.answer("✅ Takip başlatıldı")
     await state.clear()
 
 # ========== PREMIUM ==========
@@ -533,6 +656,10 @@ async def main():
     await init_db()
     print("🤖 Bot başlatılıyor...")
     print(f"Admin ID: {ADMIN_ID}")
+    
+    # Fiyat kontrol task'ını başlat
+    asyncio.create_task(check_price_drops())
+    
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
