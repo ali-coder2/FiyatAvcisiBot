@@ -64,24 +64,49 @@ async def search(q, min_p=None, max_p=None):
         "gl": "tr",
         "num": 10
     }
+    
+    # Fiyat filtreleri - Google Shopping'de price_min ve price_max kullanılır
     if min_p is not None:
-        params["min_price"] = str(int(min_p))
+        params["price_min"] = str(int(min_p))
     if max_p is not None:
-        params["max_price"] = str(int(max_p))
+        params["price_max"] = str(int(max_p))
 
-    print(f"API Çağrısı: q={q}, min={min_p}, max={max_p}")
+    print(f"API Çağrısı: {params}")
     
     loop = asyncio.get_event_loop()
     try:
         result = await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
-        print(f"API Yanıtı: {list(result.keys())}")
-        if "shopping_results" in result:
-            print(f"Sonuç sayısı: {len(result['shopping_results'])}")
-        else:
-            print(f"Hata: {result.get('error', 'Bilinmeyen hata')}")
-        return result
+        print(f"API Yanıtı tamamı: {result}")
+        
+        # Farklı yanıt yapısını kontrol et
+        shopping_results = result.get("shopping_results", [])
+        
+        # Eğer shopping_results yoksa, inline_shopping_results veya sponsored_results dene
+        if not shopping_results:
+            shopping_results = result.get("inline_shopping_results", [])
+        if not shopping_results:
+            shopping_results = result.get("sponsored_results", [])
+            
+        print(f"Bulunan sonuç sayısı: {len(shopping_results)}")
+        
+        # Sonuçları normalize et
+        normalized_results = []
+        for item in shopping_results:
+            normalized_item = {
+                "title": item.get("title", item.get("name", "Başlık yok")),
+                "price": item.get("price", item.get("extracted_price", "Fiyat yok")),
+                "link": item.get("link", item.get("product_link", "#")),
+                "thumbnail": item.get("thumbnail", item.get("image", None)),
+                "source": item.get("source", item.get("merchant", "Bilinmeyen"))
+            }
+            normalized_results.append(normalized_item)
+            
+        return {"shopping_results": normalized_results}
+        
     except Exception as e:
         print(f"API Hatası: {e}")
+        import traceback
+        traceback.print_exc()
         return {"shopping_results": []}
 
 # ========== UI ==========
@@ -104,16 +129,13 @@ def menu_kb(prem, admin):
 def product_kb(i, total, link):
     keyboard = []
     
-    # Ürüne git butonu
     keyboard.append([InlineKeyboardButton(text="🔗 Ürüne Git", url=link)])
     
-    # Favori ve Takip butonları
     keyboard.append([
         InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}"),
         InlineKeyboardButton(text="🔔 Takip", callback_data=f"track:{i}")
     ])
     
-    # Navigasyon butonları
     nav_row = []
     if i > 0:
         nav_row.append(InlineKeyboardButton(text="⬅️ Önceki", callback_data="prev"))
@@ -123,7 +145,6 @@ def product_kb(i, total, link):
     if nav_row:
         keyboard.append(nav_row)
     
-    # Menü butonu
     keyboard.append([InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")])
     
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
@@ -166,7 +187,6 @@ async def show_product(message, uid):
 
     try:
         if img:
-            # Fotoğraf varsa, mesajı fotoğrafa çevir
             await message.delete()
             await message.answer_photo(
                 photo=img,
@@ -175,7 +195,6 @@ async def show_product(message, uid):
                 reply_markup=markup
             )
         else:
-            # Fotoğraf yoksa sadece metni düzenle
             await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
     except Exception as e:
         print(f"Show hatası: {e}")
@@ -207,7 +226,6 @@ async def menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     prem = await is_premium(cb.from_user.id)
     
-    # Mesajı düzenle, silme
     await cb.message.edit_text(
         "📋 Ana Menü - İşlem seçin:",
         reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
@@ -219,7 +237,6 @@ async def menu(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "search")
 async def s(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    # Mesajı düzenle
     await cb.message.edit_text("🔍 Hangi ürünü aramak istiyorsun?\n\nÜrün adını yazın:")
     await state.set_state(States.query)
     await cb.answer()
@@ -243,8 +260,7 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
     if cb.data == "budget":
         await cb.message.edit_text("💰 Minimum fiyat (TL) girin:")
         await state.set_state(States.min_price)
-    else:  # nofilter
-        # Mesajı düzenle - Aranıyor...
+    else:
         await cb.message.edit_text("🔍 Aranıyor... Lütfen bekleyin.")
         
         res = await search(query)
@@ -259,7 +275,6 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
             return
         
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
-        # Doğrudan ürünü göster, "Aranıyor..." mesajını düzenle
         await show_product(cb.message, cb.from_user.id)
         await state.clear()
     
@@ -293,7 +308,6 @@ async def max_p(m: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Aranıyor mesajı gönder
     loading_msg = await m.answer("🔍 Aranıyor... Lütfen bekleyin.")
     
     res = await search(query, min_val, val)
@@ -308,13 +322,11 @@ async def max_p(m: Message, state: FSMContext):
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
     
-    # Loading mesajını düzenle ve sonuçları göster
     try:
         await loading_msg.delete()
     except:
         pass
     
-    # Yeni mesaj olarak gönder çünkü loading_msg text mesajıydı
     await m.answer("🔍 Sonuçlar bulundu!")
     await show_product(loading_msg, m.from_user.id)
     await state.clear()
@@ -333,7 +345,6 @@ async def nav(cb: CallbackQuery):
     else:
         c["i"] -= 1
     
-    # Sınır kontrolü
     if c["i"] < 0:
         c["i"] = 0
     if c["i"] >= len(c["data"]):
@@ -455,7 +466,6 @@ async def ad_send(m: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Tüm kullanıcılara reklam gönder
     async with aiosqlite.connect(DB) as db:
         async with db.execute("SELECT id FROM users") as c:
             users = await c.fetchall()
@@ -494,7 +504,6 @@ async def approve_premium(m: Message, state: FSMContext):
     
     code = m.text.strip()
     
-    # Kod formatı: PREM-{uid}-XXXXX
     try:
         parts = code.split("-")
         if len(parts) >= 2:
@@ -506,12 +515,10 @@ async def approve_premium(m: Message, state: FSMContext):
         await state.clear()
         return
     
-    # Premium ekle
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT OR IGNORE INTO premium VALUES (?)", (uid,))
         await db.commit()
     
-    # Kullanıcıya bildir
     try:
         await bot.send_message(uid, "🎉 Premium üyeliğiniz aktif edildi!")
     except:
