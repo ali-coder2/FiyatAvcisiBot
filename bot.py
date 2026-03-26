@@ -329,11 +329,26 @@ async def menu(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     prem = await is_premium(cb.from_user.id)
     
-    await cb.message.edit_text(
-        "📋 Ana Menü - İşlem seçin:",
-        reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
-    )
+    # Fotoğraf mesajı mı kontrol et
+    try:
+        # Önce edit etmeyi dene
+        await cb.message.edit_text(
+            "📋 Ana Menü - İşlem seçin:",
+            reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
+        )
+    except:
+        # Edit olmazsa (fotoğraf mesajıysa) silip yeni gönder
+        try:
+            await cb.message.delete()
+        except:
+            pass
+        await cb.message.answer(
+            "📋 Ana Menü - İşlem seçin:",
+            reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
+        )
+    
     await cb.answer()
+
 
 # ========== SEARCH FLOW ==========
 
