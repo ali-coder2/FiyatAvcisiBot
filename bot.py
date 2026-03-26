@@ -143,7 +143,7 @@ async def check_price_drops():
             for alert in alerts:
                 user_id, link, title, old_price_str, target_price = alert
                 
-                # Ürünü tekrar ara (link üzerinden doğrudan erişim yok, title ile arama yap)
+                # Ürünü tekrar ara
                 res = await search(title)
                 items = res.get("shopping_results", [])
                 
@@ -249,10 +249,11 @@ def budget_choice_kb():
 
 # ========== SHOW ==========
 
-async def show_product(message, uid, edit=True):
+async def show_product(message, uid, is_callback=False):
+    """Ürün göster - fotoğraf varsa silip yeni gönder, yoksa edit et"""
     data = CACHE.get(uid)
     if not data or not data["data"]:
-        if edit:
+        if is_callback:
             await message.edit_text("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
         else:
             await message.answer("❌ Ürün verisi bulunamadı.", reply_markup=back_kb())
@@ -279,8 +280,13 @@ async def show_product(message, uid, edit=True):
     markup = product_kb(i, len(data["data"]), link)
 
     try:
-        if img and not edit:
-            # İlk gösterim ve fotoğraf varsa
+        if img:
+            # Fotoğraf varsa her zaman silip yeni gönder (edit edilemez çünkü)
+            if is_callback:
+                try:
+                    await message.delete()
+                except:
+                    pass
             await message.answer_photo(
                 photo=img,
                 caption=text,
@@ -288,14 +294,17 @@ async def show_product(message, uid, edit=True):
                 reply_markup=markup
             )
         else:
-            # Edit mod veya fotoğraf yoksa
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            # Fotoğraf yoksa edit et
+            if is_callback:
+                await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await message.answer(text, parse_mode="Markdown", reply_markup=markup)
     except Exception as e:
         print(f"Show hatası: {e}")
         try:
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
-        except:
             await message.answer(text, parse_mode="Markdown", reply_markup=markup)
+        except:
+            pass
 
 # ========== START ==========
 
@@ -369,8 +378,8 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
             return
         
         CACHE[cb.from_user.id] = {"data": items, "i": 0}
-        # İlk gösterim - edit=False çünkü "Aranıyor..." mesajını düzenleyemeyiz (fotoğraf varsa)
-        await show_product(cb.message, cb.from_user.id, edit=False)
+        # İlk gösterim - callback mesajı üzerinden
+        await show_product(cb.message, cb.from_user.id, is_callback=True)
         await state.clear()
     
     await cb.answer()
@@ -417,8 +426,8 @@ async def max_p(m: Message, state: FSMContext):
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
     
-    # İlk gösterim
-    await show_product(loading_msg, m.from_user.id, edit=False)
+    # İlk gösterim - normal mesaj
+    await show_product(loading_msg, m.from_user.id, is_callback=False)
     await state.clear()
 
 # ========== NAV ==========
@@ -440,8 +449,8 @@ async def nav(cb: CallbackQuery):
     if c["i"] >= len(c["data"]):
         c["i"] = len(c["data"]) - 1
     
-    # edit=True - mesajı düzenle, silme
-    await show_product(cb.message, cb.from_user.id, edit=True)
+    # Her zaman silip yeni gönder (fotoğraf varsa edit edilemez)
+    await show_product(cb.message, cb.from_user.id, is_callback=True)
     await cb.answer()
 
 # ========== FAVORİ ==========
@@ -572,82 +581,168 @@ async def noop(cb: CallbackQuery):
 
 # ========== ADMIN - REKLAM ==========
 
-@dp.callback_query(F.data == "ad")
-async def ad_start(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_ID:
-        await cb.answer("Yetkiniz yok!")
-        return
-    
-    await cb.message.edit_text("📢 Reklam mesajını yazın:\n\n(Vazgeçmek için /cancel yazın)")
-    await state.set_state(States.ad)
-    await cb.answer()
-
 @dp.message(States.ad)
 async def ad_send(m: Message, state: FSMContext):
-    if m.text == "/cancel":
-        await m.answer("İptal edildi.", reply_markup=back_kb())
+    """Reklam mesajını tüm kullanıcılara gönder"""
+    print(f"Ad_send çağrıldı - User: {m.from_user.id}, Text: {m.text}")
+    
+    # Admin kontrolü
+    if m.from_user.id != ADMIN_ID:
+        await m.answer("⛔ Yetkiniz yok!")
         await state.clear()
         return
     
-    async with aiosqlite.connect(DB) as db:
-        async with db.execute("SELECT id FROM users") as c:
-            users = await c.fetchall()
+    # İptal kontrolü
+    if m.text and m.text.strip() == "/cancel":
+        await m.answer("❌ İptal edildi.", reply_markup=back_kb())
+        await state.clear()
+        return
+    
+    # Mesaj boş mu kontrolü
+    if not m.text or not m.text.strip():
+        await m.answer("❌ Boş mesaj gönderilemez. Lütfen bir mesaj yazın veya /cancel ile iptal edin.")
+        return
+    
+    reklam_metni = m.text.strip()
+    
+    # Kullanıcıları al
+    try:
+        async with aiosqlite.connect(DB) as db:
+            async with db.execute("SELECT id FROM users") as c:
+                users = await c.fetchall()
+        
+        print(f"Toplam kullanıcı: {len(users)}")
+        
+        if not users:
+            await m.answer("❌ Hiç kullanıcı bulunamadı.", reply_markup=back_kb())
+            await state.clear()
+            return
+        
+    except Exception as e:
+        print(f"DB hatası: {e}")
+        await m.answer(f"❌ Veritabanı hatası: {e}", reply_markup=back_kb())
+        await state.clear()
+        return
+    
+    # Gönderim işlemi
+    await m.answer("📤 Gönderiliyor... Lütfen bekleyin.")
     
     sent = 0
     failed = 0
+    failed_users = []
     
-    for user in users:
+    for user_row in users:
+        user_id = user_row[0]
         try:
-            await bot.send_message(user[0], f"📢 **Duyuru**\n\n{m.text}", parse_mode="Markdown")
+            await bot.send_message(
+                user_id, 
+                f"📢 **Duyuru**\n\n{reklam_metni}", 
+                parse_mode="Markdown"
+            )
             sent += 1
-        except:
+            print(f"Gönderildi: {user_id}")
+            # Rate limit için küçük bekleme
+            await asyncio.sleep(0.05)
+        except Exception as e:
             failed += 1
+            failed_users.append(user_id)
+            print(f"Gönderilemedi: {user_id} - {e}")
     
-    await m.answer(f"✅ {sent} kullanıcıya gönderildi.\n❌ {failed} kullanıcıya gönderilemedi.", reply_markup=back_kb())
+    # Sonuç mesajı
+    result_text = (
+        f"✅ **Gönderim Tamamlandı**\n\n"
+        f"📤 Başarılı: {sent}\n"
+        f"❌ Başarısız: {failed}\n"
+        f"👥 Toplam: {len(users)}"
+    )
+    
+    if failed > 0 and len(failed_users) <= 5:
+        result_text += f"\n\nBaşarısız ID'ler: {', '.join(map(str, failed_users))}"
+    
+    await m.answer(result_text, reply_markup=back_kb())
     await state.clear()
+    print(f"Reklam gönderimi tamamlandı - Başarılı: {sent}, Başarısız: {failed}")
 
 # ========== ADMIN - ONAY ==========
 
 @dp.callback_query(F.data == "approve")
 async def approve_start(cb: CallbackQuery, state: FSMContext):
+    """Premium onay başlat"""
+    print(f"Approve callback çağrıldı - User: {cb.from_user.id}")
+    
     if cb.from_user.id != ADMIN_ID:
-        await cb.answer("Yetkiniz yok!")
+        await cb.answer("⛔ Yetkiniz yok!", show_alert=True)
         return
     
-    await cb.message.edit_text("💳 Onaylanacak referans kodunu girin:\n\n(Vazgeçmek için /cancel yazın)")
-    await state.set_state(States.approve)
-    await cb.answer()
+    await state.clear()
+    
+    try:
+        await cb.message.edit_text(
+            "💳 **Premium Onay**\n\n"
+            "Onaylanacak referans kodunu girin:\n"
+            "(İptal için /cancel yazın)",
+            parse_mode="Markdown"
+        )
+        await state.set_state(States.approve)
+        await cb.answer("Onay modu aktif")
+    except Exception as e:
+        print(f"Approve start hatası: {e}")
+        await cb.answer("Hata oluştu")
 
 @dp.message(States.approve)
 async def approve_premium(m: Message, state: FSMContext):
-    if m.text == "/cancel":
-        await m.answer("İptal edildi.", reply_markup=back_kb())
+    """Premium onayla"""
+    print(f"Approve_premium çağrıldı - User: {m.from_user.id}, Text: {m.text}")
+    
+    # Admin kontrolü
+    if m.from_user.id != ADMIN_ID:
+        await m.answer("⛔ Yetkiniz yok!")
+        await state.clear()
+        return
+    
+    # İptal kontrolü
+    if m.text and m.text.strip() == "/cancel":
+        await m.answer("❌ İptal edildi.", reply_markup=back_kb())
         await state.clear()
         return
     
     code = m.text.strip()
     
+    # Kod formatı: PREM-{uid}-XXXXX
     try:
         parts = code.split("-")
-        if len(parts) >= 2:
+        if len(parts) >= 3 and parts[0] == "PREM":
             uid = int(parts[1])
         else:
-            raise ValueError("Geçersiz kod")
-    except:
+            await m.answer("❌ Geçersiz referans kodu formatı.\n\nÖrnek: PREM-12345-ABCDE", reply_markup=back_kb())
+            await state.clear()
+            return
+    except ValueError as e:
+        print(f"Kod parse hatası: {e}")
         await m.answer("❌ Geçersiz referans kodu formatı.", reply_markup=back_kb())
         await state.clear()
         return
     
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("INSERT OR IGNORE INTO premium VALUES (?)", (uid,))
-        await db.commit()
-    
+    # Premium ekle
     try:
-        await bot.send_message(uid, "🎉 Premium üyeliğiniz aktif edildi!")
-    except:
-        pass
+        async with aiosqlite.connect(DB) as db:
+            await db.execute("INSERT OR IGNORE INTO premium VALUES (?)", (uid,))
+            await db.commit()
+        
+        # Kullanıcıya bildir
+        try:
+            await bot.send_message(uid, "🎉 **Tebrikler!**\n\nPremium üyeliğiniz aktif edildi. Artık reklamsız kullanabilirsiniz!")
+            bildirim = "✅ Kullanıcıya bildirim gönderildi."
+        except Exception as e:
+            print(f"Bildirim hatası: {e}")
+            bildirim = "⚠️ Kullanıcıya bildirim gönderilemedi (botu engellemiş olabilir)."
+        
+        await m.answer(f"✅ Kullanıcı `{uid}` premium yapıldı.\n\n{bildirim}", reply_markup=back_kb())
+        
+    except Exception as e:
+        print(f"DB hatası: {e}")
+        await m.answer(f"❌ Veritabanı hatası: {e}", reply_markup=back_kb())
     
-    await m.answer(f"✅ Kullanıcı {uid} premium yapıldı.", reply_markup=back_kb())
     await state.clear()
 
 # ========== MAIN ==========
