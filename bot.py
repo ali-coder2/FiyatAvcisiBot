@@ -28,7 +28,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DB = "db.sqlite"
-CACHE = {}  # Kullanıcı bazlı arama cache
+CACHE = {}  # user_id: {"data": [...], "i": 0}
 
 # ====================== STATES ======================
 class States(StatesGroup):
@@ -83,9 +83,19 @@ def extract_price(price_str):
             return None
     return None
 
+def safe_edit_or_send(message, text, reply_markup=None, parse_mode="Markdown"):
+    """Mesajı güvenli şekilde edit et veya yeni gönder"""
+    try:
+        return message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except:
+        try:
+            return message.delete()
+        except:
+            pass
+        return message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
 # ====================== FİYAT TAKİP SCHEDULER ======================
 async def check_price_drops():
-    """Her 30 dakikada bir takip edilen ürünlerin fiyatlarını kontrol eder"""
     while True:
         try:
             async with aiosqlite.connect(DB) as db:
@@ -105,7 +115,6 @@ async def check_price_drops():
                         current_price_str = item.get("price", "Fiyat yok")
                         current_price_val = extract_price(current_price_str)
 
-                        # Fiyatı güncelle
                         async with aiosqlite.connect(DB) as db:
                             await db.execute(
                                 "UPDATE alerts SET current_price = ?, last_checked = ? WHERE user = ? AND link = ?",
@@ -126,18 +135,17 @@ async def check_price_drops():
                                     parse_mode="Markdown",
                                     disable_web_page_preview=True
                                 )
-                                # Takibi sil
                                 async with aiosqlite.connect(DB) as db:
                                     await db.execute("DELETE FROM alerts WHERE user = ? AND link = ?", (user_id, link))
                                     await db.commit()
                             except Exception as e:
-                                print(f"Bildirim gönderme hatası: {e}")
+                                print(f"Bildirim hatası ({user_id}): {e}")
                         break
 
             await asyncio.sleep(1800)  # 30 dakika
 
         except Exception as e:
-            print(f"Fiyat takip scheduler hatası: {e}")
+            print(f"Scheduler hatası: {e}")
             await asyncio.sleep(300)
 
 # ====================== SEARCH ======================
@@ -148,7 +156,7 @@ async def search(q, min_p=None, max_p=None):
         "q": q,
         "hl": "tr",
         "gl": "tr",
-        "num": 8
+        "num": 10
     }
     if min_p is not None:
         params["min_price"] = str(int(min_p))
@@ -162,7 +170,7 @@ async def search(q, min_p=None, max_p=None):
         shopping = result.get("shopping_results") or result.get("inline_shopping_results") or []
         
         normalized = []
-        for item in shopping[:6]:
+        for item in shopping:
             normalized.append({
                 "title": item.get("title") or item.get("name", "Başlık yok"),
                 "price": item.get("price") or item.get("extracted_price", "Fiyat yok"),
@@ -199,6 +207,67 @@ def back_kb():
         [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")]
     ])
 
+def product_kb(i, total, link):
+    kb = [
+        [InlineKeyboardButton(text="🔗 Ürüne Git", url=link)],
+        [
+            InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}"),
+            InlineKeyboardButton(text="🔔 Takip Et", callback_data=f"track:{i}")
+        ]
+    ]
+    nav = []
+    if i > 0:
+        nav.append(InlineKeyboardButton(text="⬅️ Önceki", callback_data="prev"))
+    if i < total - 1:
+        nav.append(InlineKeyboardButton(text="➡️ Sonraki", callback_data="next"))
+    if nav:
+        kb.append(nav)
+    kb.append([InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+# ====================== ÜRÜN GÖSTER ======================
+async def show_product(msg, uid, is_callback=False):
+    data = CACHE.get(uid)
+    if not data or not data.get("data"):
+        text = "❌ Ürün verisi bulunamadı."
+        if is_callback:
+            await safe_edit_or_send(msg, text, back_kb())
+        else:
+            await msg.answer(text, reply_markup=back_kb())
+        return
+
+    i = data["i"]
+    if i >= len(data["data"]):
+        i = 0
+        data["i"] = 0
+    if i < 0:
+        i = 0
+        data["i"] = 0
+
+    p = data["data"][i]
+    title = p.get("title", "Başlık yok")
+    price = p.get("price", "Fiyat yok")
+    link = p.get("link", "#")
+    img = p.get("thumbnail")
+    source = p.get("source", "Bilinmeyen")
+
+    text = f"📦 **{title}**\n\n💰 {price}\n🏪 {source}\n\n🔗 [Ürüne Git]({link})"
+
+    markup = product_kb(i, len(data["data"]), link)
+
+    if img:
+        if is_callback:
+            try:
+                await msg.delete()
+            except:
+                pass
+        await msg.answer_photo(photo=img, caption=text, parse_mode="Markdown", reply_markup=markup)
+    else:
+        if is_callback:
+            await safe_edit_or_send(msg, text, markup)
+        else:
+            await msg.answer(text, parse_mode="Markdown", reply_markup=markup)
+
 # ====================== START ======================
 @dp.message(Command("start"))
 async def start(m: Message):
@@ -219,9 +288,10 @@ async def start(m: Message):
 @dp.callback_query(F.data == "menu")
 async def menu_callback(cb: CallbackQuery):
     prem = await is_premium(cb.from_user.id)
-    await cb.message.edit_text(
+    await safe_edit_or_send(
+        cb.message,
         "📋 Ana Menü - İşlem seçin:",
-        reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
+        menu_kb(prem, cb.from_user.id == ADMIN_ID)
     )
     await cb.answer()
 
@@ -229,11 +299,7 @@ async def menu_callback(cb: CallbackQuery):
 @dp.callback_query(F.data == "search")
 async def search_start(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    try:
-        await cb.message.edit_text("🔍 Hangi ürünü aramak istiyorsun?\nÜrün adını yazın:")
-    except:
-        await cb.message.delete()
-        await cb.message.answer("🔍 Hangi ürünü aramak istiyorsun?\nÜrün adını yazın:")
+    await safe_edit_or_send(cb.message, "🔍 Hangi ürünü aramak istiyorsun?\nÜrün adını yazın:")
     await state.set_state(States.query)
     await cb.answer()
 
@@ -250,20 +316,21 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     query = data.get("q")
     if not query:
-        await cb.message.edit_text("❌ Önce ürün adı yazmalısınız.", reply_markup=back_kb())
+        await safe_edit_or_send(cb.message, "❌ Önce ürün adı yazmalısınız.", back_kb())
         await state.clear()
         await cb.answer()
         return
 
     if cb.data == "budget":
-        await cb.message.edit_text("💰 Minimum fiyat (TL) girin:")
+        await safe_edit_or_send(cb.message, "💰 Minimum fiyat (TL) girin:")
         await state.set_state(States.min_price)
     else:
-        await cb.message.edit_text("🔍 Aranıyor...")
+        await safe_edit_or_send(cb.message, "🔍 Aranıyor... Lütfen bekleyin.")
         res = await search(query)
         items = res.get("shopping_results", [])
+
         if not items:
-            await cb.message.edit_text("❌ Sonuç bulunamadı.", reply_markup=back_kb())
+            await safe_edit_or_send(cb.message, "❌ Sonuç bulunamadı.", back_kb())
             await state.clear()
             await cb.answer()
             return
@@ -296,78 +363,37 @@ async def max_price_handler(m: Message, state: FSMContext):
     query = data.get("q")
     min_val = data.get("min")
 
-    await m.answer("🔍 Aranıyor...")
+    loading = await m.answer("🔍 Aranıyor... Lütfen bekleyin.")
     res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
 
     if not items:
-        await m.answer("❌ Sonuç bulunamadı.", reply_markup=back_kb())
+        await loading.edit_text("❌ Sonuç bulunamadı.", reply_markup=back_kb())
         await state.clear()
         return
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
-    await show_product(m, m.from_user.id, is_callback=False)
+    await show_product(loading, m.from_user.id, is_callback=False)
     await state.clear()
-
-# ====================== ÜRÜN GÖSTERME ======================
-async def show_product(message, uid, is_callback=False):
-    data = CACHE.get(uid)
-    if not data or not data["data"]:
-        text = "❌ Ürün verisi bulunamadı."
-        if is_callback:
-            await message.edit_text(text, reply_markup=back_kb())
-        else:
-            await message.answer(text, reply_markup=back_kb())
-        return
-
-    i = data["i"]
-    p = data["data"][i]
-
-    title = p.get("title", "Başlık yok")
-    price = p.get("price", "Fiyat yok")
-    link = p.get("link", "#")
-    img = p.get("thumbnail")
-    source = p.get("source", "Bilinmeyen")
-
-    text = f"📦 **{title}**\n\n💰 {price}\n🏪 {source}\n\n🔗 [Ürüne Git]({link})"
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Ürüne Git", url=link)],
-        [
-            InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}"),
-            InlineKeyboardButton(text="🔔 Takip Et", callback_data=f"track:{i}")
-        ],
-        [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")]
-    ])
-
-    if img:
-        if is_callback:
-            try:
-                await message.delete()
-            except:
-                pass
-        await message.answer_photo(photo=img, caption=text, parse_mode="Markdown", reply_markup=kb)
-    else:
-        if is_callback:
-            await message.edit_text(text, parse_mode="Markdown", reply_markup=kb)
-        else:
-            await message.answer(text, parse_mode="Markdown", reply_markup=kb)
 
 # ====================== NAVİGASYON ======================
 @dp.callback_query(F.data.in_(["next", "prev"]))
 async def nav(cb: CallbackQuery):
     c = CACHE.get(cb.from_user.id)
-    if not c:
-        await cb.answer("Veri yok")
+    if not c or not c.get("data"):
+        await cb.answer("Veri bulunamadı")
         return
+
     if cb.data == "next":
         c["i"] += 1
     else:
         c["i"] -= 1
+
     if c["i"] < 0:
         c["i"] = 0
     if c["i"] >= len(c["data"]):
         c["i"] = len(c["data"]) - 1
+
     await show_product(cb.message, cb.from_user.id, is_callback=True)
     await cb.answer()
 
@@ -402,11 +428,7 @@ async def show_fav(cb: CallbackQuery):
         for title, link, price in rows:
             txt += f"• **{title}**\n💰 {price}\n🔗 [Ürüne Git]({link})\n\n"
 
-    try:
-        await cb.message.edit_text(txt, parse_mode="Markdown", reply_markup=back_kb())
-    except:
-        await cb.message.delete()
-        await cb.message.answer(txt, parse_mode="Markdown", reply_markup=back_kb())
+    await safe_edit_or_send(cb.message, txt, back_kb())
     await cb.answer()
 
 # ====================== FİYAT TAKİP ======================
@@ -426,11 +448,7 @@ async def show_alerts(cb: CallbackQuery):
         for title, link, current_price, target_price in rows:
             txt += f"• **{title}**\n💰 Şu an: {current_price}\n🎯 Hedef: {target_price} TL\n🔗 [Ürüne Git]({link})\n\n"
 
-    try:
-        await cb.message.edit_text(txt, parse_mode="Markdown", reply_markup=back_kb())
-    except:
-        await cb.message.delete()
-        await cb.message.answer(txt, parse_mode="Markdown", reply_markup=back_kb())
+    await safe_edit_or_send(cb.message, txt, back_kb())
     await cb.answer()
 
 @dp.callback_query(F.data.startswith("track:"))
@@ -466,7 +484,7 @@ async def set_target_price(m: Message, state: FSMContext):
 
     await state.clear()
 
-# ====================== PREMIUM ======================
+# ====================== PREMIUM & ADMIN ======================
 @dp.callback_query(F.data == "premium")
 async def premium_request(cb: CallbackQuery):
     if await is_premium(cb.from_user.id):
@@ -486,29 +504,21 @@ Referans Kodun:
 
 Ödeme yaptıktan sonra admin onaylayacak."""
 
-    try:
-        await cb.message.edit_text(text, parse_mode="Markdown")
-    except:
-        await cb.message.delete()
-        await cb.message.answer(text, parse_mode="Markdown")
+    await safe_edit_or_send(cb.message, text)
     await cb.answer()
 
 @dp.callback_query(F.data == "noop")
 async def noop(cb: CallbackQuery):
     await cb.answer("Zaten premium üyesiniz!")
 
-# ====================== ADMIN - REKLAM ======================
+# Admin Reklam Gönderme
 @dp.callback_query(F.data == "ad")
 async def ad_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID:
         await cb.answer("⛔ Yetkiniz yok!", show_alert=True)
         return
-
     await state.set_state(States.ad_text)
-    await cb.message.edit_text(
-        "📢 **Reklam Gönder**\n\nGöndermek istediğiniz mesajı yazın:\n(İptal için /cancel yazın)",
-        parse_mode="Markdown"
-    )
+    await safe_edit_or_send(cb.message, "📢 **Reklam Gönder**\n\nGöndermek istediğiniz mesajı yazın:\n(İptal için /cancel yazın)")
     await cb.answer()
 
 @dp.message(States.ad_text)
@@ -535,7 +545,7 @@ async def ad_send(m: Message, state: FSMContext):
 
     for (user_id,) in users:
         if await is_premium(user_id):
-            continue  # Premium kullanıcılara reklam gönderme
+            continue
         try:
             await bot.send_message(user_id, f"📢 **Duyuru**\n\n{reklam_metni}", parse_mode="Markdown")
             sent += 1
@@ -544,25 +554,19 @@ async def ad_send(m: Message, state: FSMContext):
             failed += 1
 
     await m.answer(
-        f"✅ Reklam gönderimi tamamlandı!\n\n"
-        f"Başarılı: {sent}\n"
-        f"Başarısız: {failed}",
+        f"✅ Reklam gönderimi tamamlandı!\n\nBaşarılı: {sent}\nBaşarısız: {failed}",
         reply_markup=back_kb()
     )
     await state.clear()
 
-# ====================== ADMIN - PREMIUM ONAY ======================
+# Admin Premium Onay
 @dp.callback_query(F.data == "approve")
 async def approve_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID:
         await cb.answer("⛔ Yetkiniz yok!", show_alert=True)
         return
-
     await state.set_state(States.approve_code)
-    await cb.message.edit_text(
-        "💳 **Premium Onay**\n\nOnaylanacak referans kodunu girin:\n(İptal için /cancel yazın)",
-        parse_mode="Markdown"
-    )
+    await safe_edit_or_send(cb.message, "💳 **Premium Onay**\n\nOnaylanacak referans kodunu girin:\n(İptal için /cancel yazın)")
     await cb.answer()
 
 @dp.message(States.approve_code)
