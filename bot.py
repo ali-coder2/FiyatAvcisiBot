@@ -18,7 +18,6 @@ import aiosqlite
 
 load_dotenv()
 
-# ====================== AYARLAR ======================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID"))
@@ -28,18 +27,18 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 DB = "db.sqlite"
-CACHE = {}  # user_id: {"data": [...], "i": 0}
+CACHE = {}
 
-# ====================== STATES ======================
+# ========== STATES ==========
 class States(StatesGroup):
     query = State()
     min_price = State()
     max_price = State()
     target_price = State()
-    ad_text = State()
-    approve_code = State()
+    ad = State()
+    approve = State()
 
-# ====================== DB ======================
+# ========== DB ==========
 async def init_db():
     async with aiosqlite.connect(DB) as db:
         await db.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY)")
@@ -57,12 +56,11 @@ async def init_db():
             title TEXT,
             current_price TEXT,
             target_price REAL,
-            last_checked TEXT,
             UNIQUE(user, link)
         )""")
         await db.commit()
 
-# ====================== HELPERS ======================
+# ========== HELPERS ==========
 def ref_code(uid):
     return f"PREM-{uid}-" + ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
 
@@ -83,26 +81,13 @@ def extract_price(price_str):
             return None
     return None
 
-def safe_edit_or_send(message, text, reply_markup=None, parse_mode="Markdown"):
-    """Mesajı güvenli şekilde edit et veya yeni gönder"""
-    try:
-        return message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-    except:
-        try:
-            return message.delete()
-        except:
-            pass
-        return message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
-
-# ====================== FİYAT TAKİP SCHEDULER ======================
+# ========== FİYAT KONTROLÜ (SCHEDULER) ==========
 async def check_price_drops():
     while True:
         try:
             async with aiosqlite.connect(DB) as db:
-                async with db.execute(
-                    "SELECT user, link, title, current_price, target_price FROM alerts"
-                ) as cursor:
-                    alerts = await cursor.fetchall()
+                async with db.execute("SELECT user, link, title, current_price, target_price FROM alerts") as c:
+                    alerts = await c.fetchall()
 
             for alert in alerts:
                 user_id, link, title, old_price_str, target_price = alert
@@ -110,45 +95,48 @@ async def check_price_drops():
                 res = await search(title)
                 items = res.get("shopping_results", [])
 
+                current_item = None
                 for item in items:
                     if item.get("link") == link:
-                        current_price_str = item.get("price", "Fiyat yok")
-                        current_price_val = extract_price(current_price_str)
-
-                        async with aiosqlite.connect(DB) as db:
-                            await db.execute(
-                                "UPDATE alerts SET current_price = ?, last_checked = ? WHERE user = ? AND link = ?",
-                                (current_price_str, datetime.now().isoformat(), user_id, link)
-                            )
-                            await db.commit()
-
-                        if current_price_val and current_price_val <= target_price:
-                            try:
-                                await bot.send_message(
-                                    user_id,
-                                    f"🎉 **Fiyat Düştü!**\n\n"
-                                    f"📦 {title}\n"
-                                    f"💰 Eski: {old_price_str}\n"
-                                    f"💰 Yeni: {current_price_str}\n"
-                                    f"🎯 Hedef: {target_price} TL\n\n"
-                                    f"🔗 [Ürüne Git]({link})",
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=True
-                                )
-                                async with aiosqlite.connect(DB) as db:
-                                    await db.execute("DELETE FROM alerts WHERE user = ? AND link = ?", (user_id, link))
-                                    await db.commit()
-                            except Exception as e:
-                                print(f"Bildirim hatası ({user_id}): {e}")
+                        current_item = item
                         break
+
+                if current_item:
+                    current_price_str = current_item.get("price", "Fiyat yok")
+                    current_price_val = extract_price(current_price_str)
+
+                    async with aiosqlite.connect(DB) as db:
+                        await db.execute(
+                            "UPDATE alerts SET current_price = ? WHERE user = ? AND link = ?",
+                            (current_price_str, user_id, link)
+                        )
+                        await db.commit()
+
+                    if current_price_val and current_price_val <= target_price:
+                        try:
+                            await bot.send_message(
+                                user_id,
+                                f"🎉 **Fiyat Düştü!**\n\n"
+                                f"📦 {title}\n"
+                                f"💰 Eski: {old_price_str}\n"
+                                f"💰 Yeni: {current_price_str}\n"
+                                f"🎯 Hedef: {target_price} TL\n\n"
+                                f"🔗 [Ürüne Git]({link})",
+                                parse_mode="Markdown"
+                            )
+                            async with aiosqlite.connect(DB) as db:
+                                await db.execute("DELETE FROM alerts WHERE user = ? AND link = ?", (user_id, link))
+                                await db.commit()
+                        except:
+                            pass
 
             await asyncio.sleep(1800)  # 30 dakika
 
         except Exception as e:
-            print(f"Scheduler hatası: {e}")
+            print(f"Fiyat kontrol hatası: {e}")
             await asyncio.sleep(300)
 
-# ====================== SEARCH ======================
+# ========== SEARCH ==========
 async def search(q, min_p=None, max_p=None):
     params = {
         "api_key": SERPAPI_KEY,
@@ -166,74 +154,83 @@ async def search(q, min_p=None, max_p=None):
     try:
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(None, lambda: GoogleSearch(params).get_dict())
-        
-        shopping = result.get("shopping_results") or result.get("inline_shopping_results") or []
-        
-        normalized = []
-        for item in shopping:
-            normalized.append({
-                "title": item.get("title") or item.get("name", "Başlık yok"),
-                "price": item.get("price") or item.get("extracted_price", "Fiyat yok"),
-                "link": item.get("link") or item.get("product_link", "#"),
-                "thumbnail": item.get("thumbnail") or item.get("image"),
-                "source": item.get("source") or item.get("merchant", "Bilinmeyen")
-            })
-        return {"shopping_results": normalized}
+
+        shopping_results = result.get("shopping_results", []) or result.get("inline_shopping_results", [])
+
+        normalized_results = []
+        for item in shopping_results:
+            normalized_item = {
+                "title": item.get("title", item.get("name", "Başlık yok")),
+                "price": item.get("price", item.get("extracted_price", "Fiyat yok")),
+                "link": item.get("link", item.get("product_link", "#")),
+                "thumbnail": item.get("thumbnail", item.get("image", None)),
+                "source": item.get("source", item.get("merchant", "Bilinmeyen"))
+            }
+            normalized_results.append(normalized_item)
+
+        return {"shopping_results": normalized_results}
+
     except Exception as e:
-        print(f"SerpApi Hatası: {e}")
+        print(f"API Hatası: {e}")
         return {"shopping_results": []}
 
-# ====================== MENÜ ======================
-def menu_kb(prem: bool, is_admin: bool):
+# ========== MENÜ (ADMIN BUTONLARI DÜZELTİLDİ) ==========
+def menu_kb(prem, is_admin):
     kb = [
         [InlineKeyboardButton(text="🔍 Ara", callback_data="search")],
         [InlineKeyboardButton(text="⭐ Favoriler", callback_data="fav")],
-        [InlineKeyboardButton(text="👀 Fiyat Takip", callback_data="alerts")]
+        [InlineKeyboardButton(text="📊 Takipler", callback_data="alerts")]
     ]
     if not prem:
-        kb.append([InlineKeyboardButton(text="💰 Reklamları Kaldır", callback_data="premium")])
+        kb.append([InlineKeyboardButton(text="💰 Reklam Kaldır", callback_data="premium")])
     else:
         kb.append([InlineKeyboardButton(text="✅ Premium Aktif", callback_data="noop")])
 
+    # Sadece admin görsün
     if is_admin:
-        kb.extend([
-            [InlineKeyboardButton(text="📢 Reklam Gönder", callback_data="ad")],
-            [InlineKeyboardButton(text="💳 Premium Onayla", callback_data="approve")]
-        ])
+        kb.append([InlineKeyboardButton(text="📢 Reklam Gönder", callback_data="ad")])
+        kb.append([InlineKeyboardButton(text="💳 Premium Onayla", callback_data="approve")])
+
     return InlineKeyboardMarkup(inline_keyboard=kb)
+
+def product_kb(i, total, link):
+    keyboard = []
+    keyboard.append([InlineKeyboardButton(text="🔗 Ürüne Git", url=link)])
+    keyboard.append([
+        InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}"),
+        InlineKeyboardButton(text="🔔 Takip", callback_data=f"track:{i}")
+    ])
+
+    nav_row = []
+    if i > 0:
+        nav_row.append(InlineKeyboardButton(text="⬅️ Önceki", callback_data="prev"))
+    if i < total - 1:
+        nav_row.append(InlineKeyboardButton(text="➡️ Sonraki", callback_data="next"))
+
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 def back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")]
     ])
 
-def product_kb(i, total, link):
-    kb = [
-        [InlineKeyboardButton(text="🔗 Ürüne Git", url=link)],
-        [
-            InlineKeyboardButton(text="⭐ Favori", callback_data=f"fav_add:{i}"),
-            InlineKeyboardButton(text="🔔 Takip Et", callback_data=f"track:{i}")
-        ]
-    ]
-    nav = []
-    if i > 0:
-        nav.append(InlineKeyboardButton(text="⬅️ Önceki", callback_data="prev"))
-    if i < total - 1:
-        nav.append(InlineKeyboardButton(text="➡️ Sonraki", callback_data="next"))
-    if nav:
-        kb.append(nav)
-    kb.append([InlineKeyboardButton(text="🔙 Ana Menü", callback_data="menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-# ====================== ÜRÜN GÖSTER ======================
-async def show_product(msg, uid, is_callback=False):
+# ========== SHOW PRODUCT ==========
+async def show_product(message, uid, is_callback=False):
     data = CACHE.get(uid)
-    if not data or not data.get("data"):
+    if not data or not data["data"]:
         text = "❌ Ürün verisi bulunamadı."
         if is_callback:
-            await safe_edit_or_send(msg, text, back_kb())
+            try:
+                await message.edit_text(text, reply_markup=back_kb())
+            except:
+                await message.answer(text, reply_markup=back_kb())
         else:
-            await msg.answer(text, reply_markup=back_kb())
+            await message.answer(text, reply_markup=back_kb())
         return
 
     i = data["i"]
@@ -245,6 +242,7 @@ async def show_product(msg, uid, is_callback=False):
         data["i"] = 0
 
     p = data["data"][i]
+
     title = p.get("title", "Başlık yok")
     price = p.get("price", "Fiyat yok")
     link = p.get("link", "#")
@@ -255,56 +253,71 @@ async def show_product(msg, uid, is_callback=False):
 
     markup = product_kb(i, len(data["data"]), link)
 
-    if img:
-        if is_callback:
-            try:
-                await msg.delete()
-            except:
-                pass
-        await msg.answer_photo(photo=img, caption=text, parse_mode="Markdown", reply_markup=markup)
-    else:
-        if is_callback:
-            await safe_edit_or_send(msg, text, markup)
+    try:
+        if img:
+            if is_callback:
+                try:
+                    await message.delete()
+                except:
+                    pass
+            await message.answer_photo(photo=img, caption=text, parse_mode="Markdown", reply_markup=markup)
         else:
-            await msg.answer(text, parse_mode="Markdown", reply_markup=markup)
+            if is_callback:
+                await message.edit_text(text, parse_mode="Markdown", reply_markup=markup)
+            else:
+                await message.answer(text, parse_mode="Markdown", reply_markup=markup)
+    except:
+        await message.answer(text, parse_mode="Markdown", reply_markup=markup)
 
-# ====================== START ======================
+# ========== START ==========
 @dp.message(Command("start"))
-async def start(m: Message):
-    await init_db()
+async def start(m: Message, state: FSMContext):
+    await state.clear()
     async with aiosqlite.connect(DB) as db:
         await db.execute("INSERT OR IGNORE INTO users VALUES (?)", (m.from_user.id,))
         await db.commit()
 
     prem = await is_premium(m.from_user.id)
     await m.answer(
-        "🤖 **FiyatAvcısıBot**'a hoş geldin!\n\n"
-        "En ucuz fiyatları bul, takip et, favorilerine kaydet.",
-        parse_mode="Markdown",
+        "👋 Hoş geldin! Aşağıdaki menüden işlem seçebilirsin.",
         reply_markup=menu_kb(prem, m.from_user.id == ADMIN_ID)
     )
 
-# ====================== ANA MENÜ ======================
+# ========== MENU ==========
 @dp.callback_query(F.data == "menu")
-async def menu_callback(cb: CallbackQuery):
+async def menu(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
     prem = await is_premium(cb.from_user.id)
-    await safe_edit_or_send(
-        cb.message,
-        "📋 Ana Menü - İşlem seçin:",
-        menu_kb(prem, cb.from_user.id == ADMIN_ID)
-    )
+    try:
+        await cb.message.edit_text(
+            "📋 Ana Menü - İşlem seçin:",
+            reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
+        )
+    except:
+        try:
+            await cb.message.delete()
+        except:
+            pass
+        await cb.message.answer(
+            "📋 Ana Menü - İşlem seçin:",
+            reply_markup=menu_kb(prem, cb.from_user.id == ADMIN_ID)
+        )
     await cb.answer()
 
-# ====================== ARA ======================
+# ========== SEARCH FLOW ==========
 @dp.callback_query(F.data == "search")
-async def search_start(cb: CallbackQuery, state: FSMContext):
+async def s(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await safe_edit_or_send(cb.message, "🔍 Hangi ürünü aramak istiyorsun?\nÜrün adını yazın:")
+    try:
+        await cb.message.edit_text("🔍 Hangi ürünü aramak istiyorsun?\n\nÜrün adını yazın:")
+    except:
+        await cb.message.delete()
+        await cb.message.answer("🔍 Hangi ürünü aramak istiyorsun?\n\nÜrün adını yazın:")
     await state.set_state(States.query)
     await cb.answer()
 
 @dp.message(States.query)
-async def search_query(m: Message, state: FSMContext):
+async def q(m: Message, state: FSMContext):
     await state.update_data(q=m.text)
     await m.answer("Filtre seçimi yap:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💰 Bütçe Belirle", callback_data="budget")],
@@ -315,6 +328,7 @@ async def search_query(m: Message, state: FSMContext):
 async def search_type(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     query = data.get("q")
+
     if not query:
         await safe_edit_or_send(cb.message, "❌ Önce ürün adı yazmalısınız.", back_kb())
         await state.clear()
@@ -330,7 +344,7 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
         items = res.get("shopping_results", [])
 
         if not items:
-            await safe_edit_or_send(cb.message, "❌ Sonuç bulunamadı.", back_kb())
+            await safe_edit_or_send(cb.message, "❌ Aradığınız ürün bulunamadı.", back_kb())
             await state.clear()
             await cb.answer()
             return
@@ -341,46 +355,47 @@ async def search_type(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 @dp.message(States.min_price)
-async def min_price_handler(m: Message, state: FSMContext):
+async def min_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("❌ Geçerli bir sayı girin.")
+        await m.answer("❌ Lütfen geçerli bir sayı girin.")
         return
     await state.update_data(min=val)
     await m.answer("💰 Maksimum fiyat (TL) girin:")
     await state.set_state(States.max_price)
 
 @dp.message(States.max_price)
-async def max_price_handler(m: Message, state: FSMContext):
+async def max_p(m: Message, state: FSMContext):
     try:
         val = float(m.text)
     except:
-        await m.answer("❌ Geçerli bir sayı girin.")
+        await m.answer("❌ Lütfen geçerli bir sayı girin.")
         return
 
     data = await state.get_data()
-    query = data.get("q")
     min_val = data.get("min")
+    query = data.get("q")
 
-    loading = await m.answer("🔍 Aranıyor... Lütfen bekleyin.")
+    loading_msg = await m.answer("🔍 Aranıyor... Lütfen bekleyin.")
+
     res = await search(query, min_val, val)
     items = res.get("shopping_results", [])
 
     if not items:
-        await loading.edit_text("❌ Sonuç bulunamadı.", reply_markup=back_kb())
+        await loading_msg.edit_text("❌ Aradığınız ürün bulunamadı.", reply_markup=back_kb())
         await state.clear()
         return
 
     CACHE[m.from_user.id] = {"data": items, "i": 0}
-    await show_product(loading, m.from_user.id, is_callback=False)
+    await show_product(loading_msg, m.from_user.id, is_callback=False)
     await state.clear()
 
-# ====================== NAVİGASYON ======================
+# ========== NAV ==========
 @dp.callback_query(F.data.in_(["next", "prev"]))
 async def nav(cb: CallbackQuery):
     c = CACHE.get(cb.from_user.id)
-    if not c or not c.get("data"):
+    if not c or not c["data"]:
         await cb.answer("Veri bulunamadı")
         return
 
@@ -397,11 +412,12 @@ async def nav(cb: CallbackQuery):
     await show_product(cb.message, cb.from_user.id, is_callback=True)
     await cb.answer()
 
-# ====================== FAVORİ ======================
+# ========== FAVORİ ==========
 @dp.callback_query(F.data.startswith("fav_add:"))
 async def fav_add(cb: CallbackQuery):
     i = int(cb.data.split(":")[1])
     p = CACHE[cb.from_user.id]["data"][i]
+
     async with aiosqlite.connect(DB) as db:
         try:
             await db.execute(
@@ -409,15 +425,16 @@ async def fav_add(cb: CallbackQuery):
                 (cb.from_user.id, p.get("link"), p.get("title"), p.get("price"))
             )
             await db.commit()
-            await cb.answer("✅ Favorilere eklendi!")
+            await cb.answer("✅ Favorilere eklendi")
         except:
             await cb.answer("❌ Zaten favorilerde")
 
 @dp.callback_query(F.data == "fav")
-async def show_fav(cb: CallbackQuery):
+async def fav(cb: CallbackQuery):
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
-            "SELECT title, link, price FROM fav WHERE user=?", (cb.from_user.id,)
+            "SELECT title, link, price FROM fav WHERE user=?", 
+            (cb.from_user.id,)
         ) as c:
             rows = await c.fetchall()
 
@@ -431,9 +448,9 @@ async def show_fav(cb: CallbackQuery):
     await safe_edit_or_send(cb.message, txt, back_kb())
     await cb.answer()
 
-# ====================== FİYAT TAKİP ======================
+# ========== TAKİPLER ==========
 @dp.callback_query(F.data == "alerts")
-async def show_alerts(cb: CallbackQuery):
+async def alerts(cb: CallbackQuery):
     async with aiosqlite.connect(DB) as db:
         async with db.execute(
             "SELECT title, link, current_price, target_price FROM alerts WHERE user=?", 
@@ -442,30 +459,35 @@ async def show_alerts(cb: CallbackQuery):
             rows = await c.fetchall()
 
     if not rows:
-        txt = "👀 Henüz takip ettiğin ürün yok"
+        txt = "📊 Takip ettiğin ürün yok"
     else:
-        txt = "👀 Takip Ettiğin Ürünler:\n\n"
+        txt = "📊 Takip Ettiğin Ürünler:\n\n"
         for title, link, current_price, target_price in rows:
-            txt += f"• **{title}**\n💰 Şu an: {current_price}\n🎯 Hedef: {target_price} TL\n🔗 [Ürüne Git]({link})\n\n"
+            txt += (f"• **{title}**\n"
+                   f"💰 Şu anki: {current_price}\n"
+                   f"🎯 Hedef: {target_price} TL\n"
+                   f"🔗 [Ürüne Git]({link})\n\n")
 
     await safe_edit_or_send(cb.message, txt, back_kb())
     await cb.answer()
 
+# ========== TAKİP EKLE ==========
 @dp.callback_query(F.data.startswith("track:"))
-async def track_product(cb: CallbackQuery, state: FSMContext):
+async def track(cb: CallbackQuery, state: FSMContext):
     i = int(cb.data.split(":")[1])
     p = CACHE[cb.from_user.id]["data"][i]
+
     await state.update_data(p=p)
-    await cb.message.answer("🎯 Hedef fiyat girin (TL):")
+    await cb.message.answer("🎯 Hedef fiyat gir (TL):")
     await state.set_state(States.target_price)
     await cb.answer()
 
 @dp.message(States.target_price)
-async def set_target_price(m: Message, state: FSMContext):
+async def set_price(m: Message, state: FSMContext):
     try:
-        target = float(m.text)
+        target_price = float(m.text)
     except:
-        await m.answer("❌ Geçerli bir sayı girin.")
+        await m.answer("❌ Lütfen geçerli bir sayı girin.")
         return
 
     data = await state.get_data()
@@ -475,24 +497,21 @@ async def set_target_price(m: Message, state: FSMContext):
         try:
             await db.execute(
                 "INSERT INTO alerts (user, link, title, current_price, target_price) VALUES (?, ?, ?, ?, ?)",
-                (m.from_user.id, p.get("link"), p.get("title"), p.get("price"), target)
+                (m.from_user.id, p.get("link"), p.get("title"), p.get("price"), target_price)
             )
             await db.commit()
-            await m.answer(f"✅ Takip başlatıldı!\nÜrün: {p.get('title')}\nHedef: {target} TL")
+            await m.answer(f"✅ Takip başlatıldı!\n\nÜrün: {p.get('title')}\nHedef: {target_price} TL")
         except:
-            await m.answer("❌ Bu ürün zaten takipte.")
+            await m.answer("❌ Bu ürün zaten takipte")
 
     await state.clear()
 
-# ====================== PREMIUM & ADMIN ======================
+# ========== PREMIUM ==========
 @dp.callback_query(F.data == "premium")
-async def premium_request(cb: CallbackQuery):
-    if await is_premium(cb.from_user.id):
-        await cb.answer("Zaten premium'sun!")
-        return
-
+async def prem(cb: CallbackQuery):
     code = ref_code(cb.from_user.id)
-    text = f"""💰 **Reklamları Kaldır (Premium)**
+
+    text = f"""💰 Premium (Reklamsız)
 
 Ücret: 45 TL
 
@@ -502,8 +521,10 @@ IBAN:
 Referans Kodun:
 `{code}`
 
-Ödeme yaptıktan sonra admin onaylayacak."""
-
+1️⃣ IBAN'a ödeme yap
+2️⃣ Açıklamaya kodu yaz
+3️⃣ Onay sonrası premium aktif
+"""
     await safe_edit_or_send(cb.message, text)
     await cb.answer()
 
@@ -511,30 +532,35 @@ Referans Kodun:
 async def noop(cb: CallbackQuery):
     await cb.answer("Zaten premium üyesiniz!")
 
-# Admin Reklam Gönderme
+# ========== ADMIN - REKLAM ==========
 @dp.callback_query(F.data == "ad")
 async def ad_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID:
         await cb.answer("⛔ Yetkiniz yok!", show_alert=True)
         return
-    await state.set_state(States.ad_text)
-    await safe_edit_or_send(cb.message, "📢 **Reklam Gönder**\n\nGöndermek istediğiniz mesajı yazın:\n(İptal için /cancel yazın)")
+
+    await state.clear()
+    await safe_edit_or_send(cb.message, 
+        "📢 **Reklam Gönder**\n\nGöndermek istediğiniz mesajı yazın:\n(İptal için /cancel yazın)",
+        parse_mode="Markdown")
+    await state.set_state(States.ad)
     await cb.answer()
 
-@dp.message(States.ad_text)
+@dp.message(States.ad)
 async def ad_send(m: Message, state: FSMContext):
     if m.from_user.id != ADMIN_ID:
         await m.answer("⛔ Yetkiniz yok!")
         await state.clear()
         return
 
-    if m.text.strip() == "/cancel":
+    if m.text and m.text.strip() == "/cancel":
         await m.answer("❌ İptal edildi.", reply_markup=back_kb())
         await state.clear()
         return
 
     reklam_metni = m.text.strip()
-    await m.answer("📤 Reklam gönderiliyor...")
+
+    await m.answer("📤 Gönderiliyor... Lütfen bekleyin.")
 
     sent = 0
     failed = 0
@@ -543,9 +569,8 @@ async def ad_send(m: Message, state: FSMContext):
         async with db.execute("SELECT id FROM users") as c:
             users = await c.fetchall()
 
-    for (user_id,) in users:
-        if await is_premium(user_id):
-            continue
+    for user_row in users:
+        user_id = user_row[0]
         try:
             await bot.send_message(user_id, f"📢 **Duyuru**\n\n{reklam_metni}", parse_mode="Markdown")
             sent += 1
@@ -553,45 +578,48 @@ async def ad_send(m: Message, state: FSMContext):
         except:
             failed += 1
 
-    await m.answer(
-        f"✅ Reklam gönderimi tamamlandı!\n\nBaşarılı: {sent}\nBaşarısız: {failed}",
-        reply_markup=back_kb()
-    )
+    result_text = f"✅ **Gönderim Tamamlandı**\n\n📤 Başarılı: {sent}\n❌ Başarısız: {failed}"
+    await m.answer(result_text, reply_markup=back_kb())
     await state.clear()
 
-# Admin Premium Onay
+# ========== ADMIN - ONAY ==========
 @dp.callback_query(F.data == "approve")
 async def approve_start(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_ID:
         await cb.answer("⛔ Yetkiniz yok!", show_alert=True)
         return
-    await state.set_state(States.approve_code)
-    await safe_edit_or_send(cb.message, "💳 **Premium Onay**\n\nOnaylanacak referans kodunu girin:\n(İptal için /cancel yazın)")
+
+    await state.clear()
+    await safe_edit_or_send(cb.message,
+        "💳 **Premium Onay**\n\nOnaylanacak referans kodunu girin:\n(İptal için /cancel yazın)",
+        parse_mode="Markdown")
+    await state.set_state(States.approve)
     await cb.answer()
 
-@dp.message(States.approve_code)
+@dp.message(States.approve)
 async def approve_premium(m: Message, state: FSMContext):
     if m.from_user.id != ADMIN_ID:
         await m.answer("⛔ Yetkiniz yok!")
         await state.clear()
         return
 
-    if m.text.strip() == "/cancel":
+    if m.text and m.text.strip() == "/cancel":
         await m.answer("❌ İptal edildi.", reply_markup=back_kb())
         await state.clear()
         return
 
     code = m.text.strip()
+
     try:
         parts = code.split("-")
         if len(parts) >= 3 and parts[0] == "PREM":
             uid = int(parts[1])
         else:
-            await m.answer("❌ Geçersiz kod formatı!", reply_markup=back_kb())
+            await m.answer("❌ Geçersiz format. Örnek: PREM-12345-ABCDE", reply_markup=back_kb())
             await state.clear()
             return
     except:
-        await m.answer("❌ Kod okunamadı.", reply_markup=back_kb())
+        await m.answer("❌ Geçersiz referans kodu formatı.", reply_markup=back_kb())
         await state.clear()
         return
 
@@ -600,19 +628,32 @@ async def approve_premium(m: Message, state: FSMContext):
         await db.commit()
 
     try:
-        await bot.send_message(uid, "🎉 **Tebrikler!** Premium üyeliğiniz aktif edildi!")
+        await bot.send_message(uid, "🎉 **Tebrikler!**\n\nPremium üyeliğiniz aktif edildi!")
     except:
         pass
 
-    await m.answer(f"✅ Kullanıcı {uid} premium yapıldı!", reply_markup=back_kb())
+    await m.answer(f"✅ Kullanıcı `{uid}` premium yapıldı.", reply_markup=back_kb())
     await state.clear()
 
-# ====================== MAIN ======================
+# ========== SAFE EDIT HELPER ==========
+async def safe_edit_or_send(message, text, reply_markup=None, parse_mode="Markdown"):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except:
+        try:
+            await message.delete()
+        except:
+            pass
+        await message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+# ========== MAIN ==========
 async def main():
     await init_db()
-    print("🚀 FiyatAvcısıBot çalışıyor...")
+    print("🤖 Bot başlatılıyor...")
     print(f"Admin ID: {ADMIN_ID}")
+
     asyncio.create_task(check_price_drops())
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
