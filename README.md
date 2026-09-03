@@ -29,5 +29,5 @@ Projeyi yerel bilgisayarınızda veya sunucunuzda çalıştırmak için aşağı
 
 ### 1. Projeyi Klonlayın
 ```bash
-git clone https://github.com/kullaniciadiniz/proje-adi.git
+https://github.com/ali-coder2/FiyatAvcisiBot
 cd proje-adi
