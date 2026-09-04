@@ -28,7 +28,7 @@ SerpApi Google Shopping altyapısını kullanan, anlık ürün araması yapabile
 Terminalde sırasıyla şu komutları çalıştırın:
 
 ```bash
-git clone [https://github.com/ali-coder2/FiyatAvcisiBot.git](https://github.com/ali-coder2/FiyatAvcisiBot.git)
+git clone https://github.com/ali-coder2/FiyatAvcisiBot.git
 cd FiyatAvcisiBot
 pip install -r requirements.txt
 python bot.py
